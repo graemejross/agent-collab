@@ -10,6 +10,12 @@
 
 set -e
 
+# Check dependencies
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required but not installed" >&2
+    exit 1
+fi
+
 COLLAB_DIR="/mnt/shared/collab"
 REGISTRY_DIR="${COLLAB_DIR}/registry/agents"
 

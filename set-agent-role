@@ -9,10 +9,17 @@
 
 set -e
 
+# Check dependencies
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required but not installed" >&2
+    exit 1
+fi
+
 COLLAB_DIR="/mnt/shared/collab"
 REGISTRY_DIR="${COLLAB_DIR}/registry/agents"
 
 usage() {
+    local exit_code="${1:-0}"
     echo "Usage: set-agent-role AGENT_ID ROLE"
     echo ""
     echo "Arguments:"
@@ -22,15 +29,26 @@ usage() {
     echo "Examples:"
     echo "  set-agent-role claude-1 supervisor"
     echo "  set-agent-role codex-1 verifier"
-    exit 0
+    exit "$exit_code"
 }
 
-if [[ $# -lt 2 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
-    usage
+if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    usage 0
+fi
+
+if [[ $# -lt 2 ]]; then
+    echo "Error: Missing arguments" >&2
+    usage 1
 fi
 
 AGENT_ID="$1"
 NEW_ROLE="$2"
+
+# Security: Validate agent ID format (prevent path traversal)
+if [[ ! "$AGENT_ID" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
+    echo "Error: Invalid AGENT_ID '$AGENT_ID'. Must start with letter, contain only alphanumeric, dash, underscore." >&2
+    exit 1
+fi
 
 # Validate role
 case $NEW_ROLE in

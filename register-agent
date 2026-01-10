@@ -15,8 +15,17 @@
 
 set -e
 
+# Check dependencies
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required but not installed" >&2
+    exit 1
+fi
+
 COLLAB_DIR="/mnt/shared/collab"
 REGISTRY_DIR="${COLLAB_DIR}/registry/agents"
+
+# Ensure registry directory exists
+mkdir -p "$REGISTRY_DIR"
 
 # Defaults
 ROLE="worker"
@@ -26,10 +35,12 @@ MODEL=""
 AGENT_ID=""
 
 usage() {
+    local exit_code="${1:-0}"
     echo "Usage: register-agent AGENT_ID --model MODEL --provider PROVIDER [OPTIONS]"
     echo ""
     echo "Arguments:"
     echo "  AGENT_ID              Unique agent identifier (e.g., claude-1, codex-1)"
+    echo "                        Must match: ^[a-zA-Z][a-zA-Z0-9_-]*$"
     echo ""
     echo "Required Options:"
     echo "  --model MODEL         Model identifier (e.g., claude-opus-4, gpt-5.2-codex)"
@@ -43,7 +54,7 @@ usage() {
     echo "  register-agent claude-1 --model claude-opus-4 --provider anthropic"
     echo "  register-agent codex-1 --model gpt-5.2-codex --provider openai --role worker"
     echo "  register-agent gemini-1 --model gemini-2.0-flash --provider google --role verifier"
-    exit 0
+    exit "$exit_code"
 }
 
 # Parse arguments
@@ -87,7 +98,13 @@ done
 # Validation
 if [[ -z "$AGENT_ID" ]]; then
     echo "Error: AGENT_ID is required" >&2
-    usage
+    usage 1
+fi
+
+# Security: Validate agent ID format (prevent path traversal)
+if [[ ! "$AGENT_ID" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
+    echo "Error: Invalid AGENT_ID '$AGENT_ID'. Must start with letter, contain only alphanumeric, dash, underscore." >&2
+    exit 1
 fi
 
 if [[ -z "$MODEL" ]]; then
