@@ -1,0 +1,131 @@
+#!/bin/bash
+#
+# collab-start - Initialize a collaborative session
+#
+# Usage:
+#   collab-start mysession          # Start as auto-detected agent
+#   collab-start mysession claude   # Start as claude
+#   collab-start mysession codex    # Start as codex
+#
+# This script:
+# 1. Creates the session if it doesn't exist
+# 2. Sets environment variables for other collab scripts
+# 3. Starts the poller daemon in the background
+# 4. Prints session status
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Parse arguments
+SESSION="${1:-}"
+AGENT="${2:-}"
+
+if [[ -z "$SESSION" ]]; then
+    echo "Usage: collab-start SESSION [AGENT]"
+    echo ""
+    echo "Examples:"
+    echo "  collab-start mysession           # Auto-detect agent from hostname"
+    echo "  collab-start mysession claude    # Start as claude"
+    echo "  collab-start mysession codex     # Start as codex"
+    echo "  collab-start mysession human     # Join as human participant"
+    exit 1
+fi
+
+# Auto-detect agent from hostname if not specified
+if [[ -z "$AGENT" ]]; then
+    case "$(hostname)" in
+        claude*) AGENT="claude" ;;
+        codex*)  AGENT="codex" ;;
+        *)
+            echo "Cannot auto-detect agent from hostname '$(hostname)'"
+            echo "Please specify agent: collab-start $SESSION <claude|codex|human>"
+            exit 1
+            ;;
+    esac
+fi
+
+# Validate agent name
+case "$AGENT" in
+    claude|codex|human) ;;
+    *)
+        echo "Warning: Non-standard agent name '$AGENT' (expected: claude, codex, human)"
+        ;;
+esac
+
+# Create session directories
+CHANNEL_DIR="${COLLAB_DIR}/channels/${SESSION}"
+SESSION_FILE="${COLLAB_DIR}/sessions/${SESSION}.json"
+
+mkdir -p "$CHANNEL_DIR"
+mkdir -p "${COLLAB_DIR}/sessions"
+
+# Create or update session metadata
+if [[ ! -f "$SESSION_FILE" ]]; then
+    CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    jq -n \
+        --arg id "$SESSION" \
+        --arg created "$CREATED" \
+        --arg mode "chat" \
+        '{
+            id: $id,
+            created: $created,
+            mode: $mode,
+            agents: [],
+            turn: null
+        }' > "$SESSION_FILE"
+    echo "Created new session: $SESSION"
+else
+    echo "Joining existing session: $SESSION"
+fi
+
+# Add this agent to session if not already present
+AGENTS=$(jq -r '.agents // []' "$SESSION_FILE")
+if ! echo "$AGENTS" | jq -e "index(\"$AGENT\")" > /dev/null 2>&1; then
+    jq --arg agent "$AGENT" '.agents += [$agent]' "$SESSION_FILE" > "${SESSION_FILE}.tmp"
+    mv "${SESSION_FILE}.tmp" "$SESSION_FILE"
+fi
+
+# Export environment variables
+export COLLAB_SESSION="$SESSION"
+export COLLAB_AGENT="$AGENT"
+
+# Print session info
+echo ""
+echo "═══════════════════════════════════════════════════════════"
+echo "  COLLABORATION SESSION"
+echo "═══════════════════════════════════════════════════════════"
+echo "  Session:  $SESSION"
+echo "  Agent:    $AGENT"
+echo "  Mode:     $(jq -r '.mode // "chat"' "$SESSION_FILE")"
+echo "  Agents:   $(jq -r '.agents | join(", ")' "$SESSION_FILE")"
+echo "═══════════════════════════════════════════════════════════"
+echo ""
+echo "Environment variables set:"
+echo "  export COLLAB_SESSION=$SESSION"
+echo "  export COLLAB_AGENT=$AGENT"
+echo ""
+echo "Quick commands:"
+echo "  send-message 'Hello!'        # Send a message"
+echo "  read-messages                # View recent messages"
+echo "  read-messages --follow       # Watch for new messages"
+echo "  collab-status                # Check session status"
+echo ""
+
+# Check if poller should be started
+echo "To start the message poller (shows incoming messages):"
+echo "  ${SCRIPT_DIR}/poller.py $SESSION $AGENT &"
+echo ""
+
+# Optionally start poller automatically
+if [[ "${COLLAB_AUTO_POLLER:-}" == "1" ]]; then
+    echo "Starting poller in background..."
+    nohup "${SCRIPT_DIR}/poller.py" "$SESSION" "$AGENT" > /dev/null 2>&1 &
+    echo "Poller PID: $!"
+fi
+
+# Output the export commands for sourcing
+echo "# Run this to set environment:"
+echo "export COLLAB_SESSION=$SESSION COLLAB_AGENT=$AGENT"

@@ -1,0 +1,156 @@
+#!/bin/bash
+#
+# send-message - Send a message to the collaboration channel
+#
+# Usage:
+#   send-message "Hello from Claude!"
+#   send-message --from human "What about error handling?"
+#   send-message --code "print('hello')" "Here's a code example"
+#   send-message --to codex "This is just for you"
+#
+# Environment:
+#   COLLAB_SESSION - Session ID (or use --session)
+#   COLLAB_AGENT   - Agent name (or use --from)
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+
+# Defaults
+SESSION="${COLLAB_SESSION:-}"
+AGENT="${COLLAB_AGENT:-}"
+TO="all"
+CODE=""
+TYPE="chat"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --session|-s)
+            SESSION="$2"
+            shift 2
+            ;;
+        --from|-f)
+            AGENT="$2"
+            shift 2
+            ;;
+        --to|-t)
+            TO="$2"
+            shift 2
+            ;;
+        --code|-c)
+            CODE="$2"
+            shift 2
+            ;;
+        --type)
+            TYPE="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: send-message [OPTIONS] MESSAGE"
+            echo ""
+            echo "Options:"
+            echo "  --session, -s SESSION   Session ID (or set COLLAB_SESSION)"
+            echo "  --from, -f AGENT        Sender name (or set COLLAB_AGENT)"
+            echo "  --to, -t TARGET         Recipient (default: all)"
+            echo "  --code, -c CODE         Include code block"
+            echo "  --type TYPE             Message type (default: chat)"
+            echo ""
+            echo "Example:"
+            echo "  export COLLAB_SESSION=mysession COLLAB_AGENT=claude"
+            echo "  send-message 'Hello!'"
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Get message text
+MESSAGE="$*"
+
+if [[ -z "$MESSAGE" ]]; then
+    echo "Error: No message provided" >&2
+    exit 1
+fi
+
+if [[ -z "$SESSION" ]]; then
+    echo "Error: No session specified. Set COLLAB_SESSION or use --session" >&2
+    exit 1
+fi
+
+if [[ -z "$AGENT" ]]; then
+    echo "Error: No agent specified. Set COLLAB_AGENT or use --from" >&2
+    exit 1
+fi
+
+# Generate message ID
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+TIMESTAMP_FILE=$(date -u +"%Y%m%d-%H%M%S")
+RANDOM_SUFFIX=$(printf '%04x' $RANDOM)
+MSG_ID="msg-${TIMESTAMP_FILE}-${AGENT}-${RANDOM_SUFFIX}"
+
+# Build JSON message
+CHANNEL_DIR="${COLLAB_DIR}/channels/${SESSION}"
+mkdir -p "$CHANNEL_DIR"
+
+# Create message JSON
+if [[ -n "$CODE" ]]; then
+    CODE_JSON=$(printf '%s' "$CODE" | jq -Rs .)
+else
+    CODE_JSON="null"
+fi
+
+MESSAGE_JSON=$(jq -n \
+    --arg id "$MSG_ID" \
+    --arg ts "$TIMESTAMP" \
+    --arg session "$SESSION" \
+    --arg from "$AGENT" \
+    --arg to "$TO" \
+    --arg type "$TYPE" \
+    --arg text "$MESSAGE" \
+    --argjson code "$CODE_JSON" \
+    '{
+        id: $id,
+        timestamp: $ts,
+        session_id: $session,
+        from: $from,
+        to: $to,
+        type: $type,
+        content: {
+            text: $text,
+            code: $code,
+            artifacts: []
+        },
+        metadata: {
+            mode: "chat",
+            turn: $from,
+            in_reply_to: null
+        }
+    }')
+
+# Atomic write: write to tmp, then rename
+TMP_FILE="${CHANNEL_DIR}/.${MSG_ID}.tmp"
+FINAL_FILE="${CHANNEL_DIR}/${MSG_ID}.json"
+
+echo "$MESSAGE_JSON" > "$TMP_FILE"
+mv "$TMP_FILE" "$FINAL_FILE"
+
+# Display confirmation with color
+case $AGENT in
+    claude) COLOR="\033[94m" ;;
+    codex)  COLOR="\033[92m" ;;
+    human)  COLOR="\033[93m" ;;
+    *)      COLOR="\033[0m" ;;
+esac
+RESET="\033[0m"
+BOLD="\033[1m"
+
+TIME_STR=$(date -u +"%H:%M:%S")
+echo -e "${BOLD}${COLOR}[${TIME_STR}] ${AGENT}${RESET}: ${MESSAGE}"

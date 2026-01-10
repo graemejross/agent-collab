@@ -1,0 +1,172 @@
+#!/bin/bash
+#
+# collab-status - Show collaboration session status
+#
+# Usage:
+#   collab-status                # Status of current session
+#   collab-status mysession      # Status of specific session
+#   collab-status --list         # List all sessions
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+
+# Colors
+BLUE="\033[94m"
+GREEN="\033[92m"
+YELLOW="\033[93m"
+GRAY="\033[90m"
+RED="\033[91m"
+RESET="\033[0m"
+BOLD="\033[1m"
+
+# Parse arguments
+LIST_ALL=false
+SESSION="${1:-${COLLAB_SESSION:-}}"
+
+case "$SESSION" in
+    --list|-l)
+        LIST_ALL=true
+        SESSION=""
+        ;;
+    --help|-h)
+        echo "Usage: collab-status [SESSION | --list]"
+        echo ""
+        echo "Options:"
+        echo "  SESSION          Show status of specific session"
+        echo "  --list, -l       List all sessions"
+        echo ""
+        echo "If no session specified, uses COLLAB_SESSION environment variable."
+        exit 0
+        ;;
+esac
+
+list_sessions() {
+    echo -e "${BOLD}Available Sessions${RESET}"
+    echo ""
+
+    if [[ ! -d "${COLLAB_DIR}/sessions" ]]; then
+        echo "No sessions found."
+        return
+    fi
+
+    for session_file in "${COLLAB_DIR}/sessions"/*.json; do
+        [[ -f "$session_file" ]] || continue
+
+        local id=$(jq -r '.id' "$session_file")
+        local mode=$(jq -r '.mode // "chat"' "$session_file")
+        local agents=$(jq -r '.agents | join(", ")' "$session_file")
+        local created=$(jq -r '.created // "unknown"' "$session_file")
+
+        # Count messages
+        local msg_count=0
+        if [[ -d "${COLLAB_DIR}/channels/${id}" ]]; then
+            msg_count=$(ls -1 "${COLLAB_DIR}/channels/${id}"/*.json 2>/dev/null | wc -l)
+        fi
+
+        echo -e "${BOLD}$id${RESET}"
+        echo "  Mode: $mode | Messages: $msg_count | Agents: $agents"
+        echo ""
+    done
+}
+
+show_status() {
+    local session="$1"
+
+    if [[ -z "$session" ]]; then
+        echo "Error: No session specified. Use COLLAB_SESSION or provide session name." >&2
+        exit 1
+    fi
+
+    local session_file="${COLLAB_DIR}/sessions/${session}.json"
+    local channel_dir="${COLLAB_DIR}/channels/${session}"
+
+    if [[ ! -f "$session_file" ]]; then
+        echo "Session '$session' not found." >&2
+        exit 1
+    fi
+
+    echo ""
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}  SESSION: $session${RESET}"
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════${RESET}"
+    echo ""
+
+    # Session info
+    echo -e "${BOLD}Session Info${RESET}"
+    echo "  Mode:    $(jq -r '.mode // "chat"' "$session_file")"
+    echo "  Created: $(jq -r '.created // "unknown"' "$session_file")"
+    echo "  Turn:    $(jq -r '.turn // "none"' "$session_file")"
+    echo ""
+
+    # Agent presence
+    echo -e "${BOLD}Agent Presence${RESET}"
+    local now=$(date +%s)
+    local stale_threshold=30  # seconds
+
+    for agent in claude codex human; do
+        local presence_file="${COLLAB_DIR}/signals/presence/${agent}.json"
+        if [[ -f "$presence_file" ]]; then
+            local ts=$(jq -r '.timestamp' "$presence_file")
+            local agent_session=$(jq -r '.session' "$presence_file")
+            local status=$(jq -r '.status' "$presence_file")
+
+            # Check if heartbeat is recent
+            local heartbeat_time=$(date -d "$ts" +%s 2>/dev/null || echo 0)
+            local age=$((now - heartbeat_time))
+
+            if [[ "$agent_session" == "$session" && $age -lt $stale_threshold ]]; then
+                echo -e "  ${GREEN}●${RESET} $agent: $status (${age}s ago)"
+            elif [[ "$agent_session" == "$session" ]]; then
+                echo -e "  ${YELLOW}○${RESET} $agent: stale (${age}s ago)"
+            else
+                echo -e "  ${GRAY}○${RESET} $agent: different session"
+            fi
+        else
+            echo -e "  ${GRAY}○${RESET} $agent: offline"
+        fi
+    done
+    echo ""
+
+    # Message stats
+    echo -e "${BOLD}Messages${RESET}"
+    if [[ -d "$channel_dir" ]]; then
+        local total=$(ls -1 "$channel_dir"/*.json 2>/dev/null | wc -l)
+        local claude_msgs=$(grep -l '"from": "claude"' "$channel_dir"/*.json 2>/dev/null | wc -l || echo 0)
+        local codex_msgs=$(grep -l '"from": "codex"' "$channel_dir"/*.json 2>/dev/null | wc -l || echo 0)
+        local human_msgs=$(grep -l '"from": "human"' "$channel_dir"/*.json 2>/dev/null | wc -l || echo 0)
+
+        echo "  Total:   $total"
+        echo "  Claude:  $claude_msgs"
+        echo "  Codex:   $codex_msgs"
+        echo "  Human:   $human_msgs"
+
+        # Last message
+        local last_file=$(ls -1 "$channel_dir"/*.json 2>/dev/null | sort | tail -1)
+        if [[ -n "$last_file" && -f "$last_file" ]]; then
+            local last_from=$(jq -r '.from' "$last_file")
+            local last_ts=$(jq -r '.timestamp' "$last_file")
+            local last_text=$(jq -r '.content.text' "$last_file" | head -c 50)
+            echo ""
+            echo "  Last: [$last_from] \"$last_text...\""
+        fi
+    else
+        echo "  No messages yet."
+    fi
+    echo ""
+
+    # Current environment
+    if [[ -n "$COLLAB_SESSION" || -n "$COLLAB_AGENT" ]]; then
+        echo -e "${BOLD}Environment${RESET}"
+        echo "  COLLAB_SESSION: ${COLLAB_SESSION:-<not set>}"
+        echo "  COLLAB_AGENT:   ${COLLAB_AGENT:-<not set>}"
+        echo ""
+    fi
+}
+
+if $LIST_ALL; then
+    list_sessions
+else
+    show_status "$SESSION"
+fi
