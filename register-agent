@@ -1,0 +1,157 @@
+#!/bin/bash
+#
+# register-agent - Register an agent in the collaboration system
+#
+# Usage:
+#   register-agent claude-1 --model claude-opus-4 --provider anthropic
+#   register-agent codex-1 --model gpt-5.2-codex --provider openai --role worker
+#
+# Options:
+#   --model       Model identifier (required)
+#   --provider    Provider name (anthropic, openai, google)
+#   --role        Agent role: worker, verifier, supervisor (default: worker)
+#   --capabilities Comma-separated list (default: code,analysis)
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+REGISTRY_DIR="${COLLAB_DIR}/registry/agents"
+
+# Defaults
+ROLE="worker"
+CAPABILITIES="code,analysis"
+PROVIDER=""
+MODEL=""
+AGENT_ID=""
+
+usage() {
+    echo "Usage: register-agent AGENT_ID --model MODEL --provider PROVIDER [OPTIONS]"
+    echo ""
+    echo "Arguments:"
+    echo "  AGENT_ID              Unique agent identifier (e.g., claude-1, codex-1)"
+    echo ""
+    echo "Required Options:"
+    echo "  --model MODEL         Model identifier (e.g., claude-opus-4, gpt-5.2-codex)"
+    echo "  --provider PROVIDER   Provider name (anthropic, openai, google)"
+    echo ""
+    echo "Optional:"
+    echo "  --role ROLE           Agent role: worker, verifier, supervisor (default: worker)"
+    echo "  --capabilities LIST   Comma-separated capabilities (default: code,analysis)"
+    echo ""
+    echo "Examples:"
+    echo "  register-agent claude-1 --model claude-opus-4 --provider anthropic"
+    echo "  register-agent codex-1 --model gpt-5.2-codex --provider openai --role worker"
+    echo "  register-agent gemini-1 --model gemini-2.0-flash --provider google --role verifier"
+    exit 0
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model|-m)
+            MODEL="$2"
+            shift 2
+            ;;
+        --provider|-p)
+            PROVIDER="$2"
+            shift 2
+            ;;
+        --role|-r)
+            ROLE="$2"
+            shift 2
+            ;;
+        --capabilities|-c)
+            CAPABILITIES="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            if [[ -z "$AGENT_ID" ]]; then
+                AGENT_ID="$1"
+            else
+                echo "Unexpected argument: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validation
+if [[ -z "$AGENT_ID" ]]; then
+    echo "Error: AGENT_ID is required" >&2
+    usage
+fi
+
+if [[ -z "$MODEL" ]]; then
+    echo "Error: --model is required" >&2
+    exit 1
+fi
+
+if [[ -z "$PROVIDER" ]]; then
+    echo "Error: --provider is required" >&2
+    exit 1
+fi
+
+# Validate role
+case $ROLE in
+    worker|verifier|supervisor)
+        ;;
+    *)
+        echo "Error: Invalid role '$ROLE'. Must be: worker, verifier, or supervisor" >&2
+        exit 1
+        ;;
+esac
+
+# Validate provider
+case $PROVIDER in
+    anthropic|openai|google)
+        ;;
+    *)
+        echo "Warning: Unknown provider '$PROVIDER'. Continuing anyway." >&2
+        ;;
+esac
+
+# Convert capabilities to JSON array
+IFS=',' read -ra CAP_ARRAY <<< "$CAPABILITIES"
+CAP_JSON=$(printf '%s\n' "${CAP_ARRAY[@]}" | jq -R . | jq -s .)
+
+# Get current timestamp
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Check if agent already exists
+AGENT_FILE="${REGISTRY_DIR}/${AGENT_ID}.json"
+if [[ -f "$AGENT_FILE" ]]; then
+    echo "Agent '$AGENT_ID' already registered. Updating..." >&2
+    REGISTERED=$(jq -r '.registered' "$AGENT_FILE")
+else
+    REGISTERED="$TIMESTAMP"
+fi
+
+# Create agent profile
+cat > "$AGENT_FILE" << EOF
+{
+  "id": "${AGENT_ID}",
+  "model": "${MODEL}",
+  "provider": "${PROVIDER}",
+  "capabilities": ${CAP_JSON},
+  "status": "available",
+  "role": "${ROLE}",
+  "registered": "${REGISTERED}",
+  "last_seen": "${TIMESTAMP}"
+}
+EOF
+
+echo "Registered agent: ${AGENT_ID}"
+echo "  Model:        ${MODEL}"
+echo "  Provider:     ${PROVIDER}"
+echo "  Role:         ${ROLE}"
+echo "  Capabilities: ${CAPABILITIES}"
+echo "  File:         ${AGENT_FILE}"

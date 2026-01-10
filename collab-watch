@@ -1,0 +1,172 @@
+#!/bin/bash
+#
+# collab-watch - Watch a collaboration session in real-time
+#
+# Usage:
+#   collab-watch                    # Watch current session
+#   collab-watch mysession          # Watch specific session
+#   collab-watch --compact          # Compact view (less spacing)
+#
+# This provides a cleaner observer view than read-messages --follow
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+SESSION="${1:-${COLLAB_SESSION:-}}"
+COMPACT=false
+
+# Parse arguments
+for arg in "$@"; do
+    case $arg in
+        --compact|-c)
+            COMPACT=true
+            ;;
+        --help|-h)
+            echo "Usage: collab-watch [SESSION] [--compact]"
+            echo ""
+            echo "Watch a collaboration session in real-time."
+            echo "Messages appear as they're sent, color-coded by agent."
+            echo ""
+            echo "Options:"
+            echo "  --compact, -c    Less spacing between messages"
+            echo ""
+            echo "Colors:"
+            echo "  Blue   = Claude"
+            echo "  Green  = Codex"
+            echo "  Yellow = Human"
+            exit 0
+            ;;
+        -*)
+            ;;
+        *)
+            SESSION="$arg"
+            ;;
+    esac
+done
+
+if [[ -z "$SESSION" ]]; then
+    echo "Error: No session specified."
+    echo "Usage: collab-watch SESSION"
+    echo ""
+    echo "Available sessions:"
+    ls -1 "${COLLAB_DIR}/sessions/"*.json 2>/dev/null | xargs -I{} basename {} .json | sed 's/^/  /'
+    exit 1
+fi
+
+CHANNEL_DIR="${COLLAB_DIR}/channels/${SESSION}"
+
+if [[ ! -d "$CHANNEL_DIR" ]]; then
+    echo "Session '$SESSION' not found or has no messages yet."
+    exit 1
+fi
+
+# Colors
+BLUE="\033[94m"
+GREEN="\033[92m"
+YELLOW="\033[93m"
+GRAY="\033[90m"
+CYAN="\033[96m"
+RESET="\033[0m"
+BOLD="\033[1m"
+DIM="\033[2m"
+
+# Clear screen and show header
+clear
+echo -e "${BOLD}╔════════════════════════════════════════════════════════════════╗${RESET}"
+echo -e "${BOLD}║  COLLABORATION SESSION: ${CYAN}${SESSION}${RESET}${BOLD}$(printf '%*s' $((39 - ${#SESSION})) '')║${RESET}"
+echo -e "${BOLD}╠════════════════════════════════════════════════════════════════╣${RESET}"
+echo -e "${BOLD}║${RESET}  ${BLUE}■ Claude${RESET}    ${GREEN}■ Codex${RESET}    ${YELLOW}■ Human${RESET}                              ${BOLD}║${RESET}"
+echo -e "${BOLD}╚════════════════════════════════════════════════════════════════╝${RESET}"
+echo ""
+echo -e "${DIM}Watching for messages... (Ctrl+C to stop)${RESET}"
+echo ""
+
+# Track seen messages
+declare -A seen
+
+# Show existing messages
+for file in "$CHANNEL_DIR"/*.json; do
+    [[ -f "$file" ]] || continue
+    seen["$(basename "$file")"]=1
+
+    from=$(jq -r '.from // "unknown"' "$file")
+    text=$(jq -r '.content.text // ""' "$file")
+    code=$(jq -r '.content.code // empty' "$file")
+    timestamp=$(jq -r '.timestamp // ""' "$file")
+
+    # Format timestamp
+    if [[ -n "$timestamp" ]]; then
+        time_str=$(date -d "$timestamp" +"%H:%M:%S" 2>/dev/null || echo "??:??:??")
+    else
+        time_str="??:??:??"
+    fi
+
+    # Color based on sender
+    case $from in
+        claude) color="$BLUE"; icon="●" ;;
+        codex)  color="$GREEN"; icon="●" ;;
+        human)  color="$YELLOW"; icon="●" ;;
+        *)      color="$GRAY"; icon="○" ;;
+    esac
+
+    # Print message with box
+    echo -e "${color}${icon} ${BOLD}${from}${RESET} ${DIM}${time_str}${RESET}"
+    echo -e "  ${text}"
+
+    if [[ -n "$code" ]]; then
+        echo -e "  ${DIM}┌──────────────────────────────────────────────────────────┐${RESET}"
+        echo "$code" | sed 's/^/  │ /'
+        echo -e "  ${DIM}└──────────────────────────────────────────────────────────┘${RESET}"
+    fi
+
+    if ! $COMPACT; then
+        echo ""
+    fi
+done 2>/dev/null
+
+# Watch for new messages
+while true; do
+    for file in "$CHANNEL_DIR"/*.json; do
+        [[ -f "$file" ]] || continue
+        basename=$(basename "$file")
+
+        if [[ -z "${seen[$basename]}" ]]; then
+            seen["$basename"]=1
+
+            from=$(jq -r '.from // "unknown"' "$file")
+            text=$(jq -r '.content.text // ""' "$file")
+            code=$(jq -r '.content.code // empty' "$file")
+            timestamp=$(jq -r '.timestamp // ""' "$file")
+
+            if [[ -n "$timestamp" ]]; then
+                time_str=$(date -d "$timestamp" +"%H:%M:%S" 2>/dev/null || echo "??:??:??")
+            else
+                time_str="??:??:??"
+            fi
+
+            case $from in
+                claude) color="$BLUE"; icon="●" ;;
+                codex)  color="$GREEN"; icon="●" ;;
+                human)  color="$YELLOW"; icon="●" ;;
+                *)      color="$GRAY"; icon="○" ;;
+            esac
+
+            # Flash effect for new message
+            echo -e "\033[7m${color}${icon} ${BOLD}${from}${RESET}\033[27m ${DIM}${time_str}${RESET} ${DIM}← NEW${RESET}"
+            echo -e "  ${text}"
+
+            if [[ -n "$code" ]]; then
+                echo -e "  ${DIM}┌──────────────────────────────────────────────────────────┐${RESET}"
+                echo "$code" | sed 's/^/  │ /'
+                echo -e "  ${DIM}└──────────────────────────────────────────────────────────┘${RESET}"
+            fi
+
+            if ! $COMPACT; then
+                echo ""
+            fi
+        fi
+    done
+
+    sleep 0.5
+done

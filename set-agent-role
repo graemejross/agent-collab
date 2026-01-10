@@ -1,0 +1,66 @@
+#!/bin/bash
+#
+# set-agent-role - Change an agent's role in the collaboration system
+#
+# Usage:
+#   set-agent-role claude-1 supervisor
+#   set-agent-role codex-1 verifier
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+REGISTRY_DIR="${COLLAB_DIR}/registry/agents"
+
+usage() {
+    echo "Usage: set-agent-role AGENT_ID ROLE"
+    echo ""
+    echo "Arguments:"
+    echo "  AGENT_ID    Agent identifier (e.g., claude-1)"
+    echo "  ROLE        New role: worker, verifier, or supervisor"
+    echo ""
+    echo "Examples:"
+    echo "  set-agent-role claude-1 supervisor"
+    echo "  set-agent-role codex-1 verifier"
+    exit 0
+}
+
+if [[ $# -lt 2 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    usage
+fi
+
+AGENT_ID="$1"
+NEW_ROLE="$2"
+
+# Validate role
+case $NEW_ROLE in
+    worker|verifier|supervisor)
+        ;;
+    *)
+        echo "Error: Invalid role '$NEW_ROLE'. Must be: worker, verifier, or supervisor" >&2
+        exit 1
+        ;;
+esac
+
+# Check if agent exists
+AGENT_FILE="${REGISTRY_DIR}/${AGENT_ID}.json"
+if [[ ! -f "$AGENT_FILE" ]]; then
+    echo "Error: Agent '$AGENT_ID' not found" >&2
+    exit 1
+fi
+
+# Get current role
+OLD_ROLE=$(jq -r '.role' "$AGENT_FILE")
+
+if [[ "$OLD_ROLE" == "$NEW_ROLE" ]]; then
+    echo "Agent '$AGENT_ID' already has role: $NEW_ROLE"
+    exit 0
+fi
+
+# Update role and last_seen
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+jq --arg role "$NEW_ROLE" --arg ts "$TIMESTAMP" \
+    '.role = $role | .last_seen = $ts' "$AGENT_FILE" > "${AGENT_FILE}.tmp"
+mv "${AGENT_FILE}.tmp" "$AGENT_FILE"
+
+echo "Updated agent '$AGENT_ID' role: $OLD_ROLE -> $NEW_ROLE"

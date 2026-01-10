@@ -1,0 +1,128 @@
+#!/bin/bash
+#
+# list-agents - List all registered agents in the collaboration system
+#
+# Usage:
+#   list-agents              # List all agents
+#   list-agents --role worker    # Filter by role
+#   list-agents --json       # Output as JSON
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+REGISTRY_DIR="${COLLAB_DIR}/registry/agents"
+
+# Options
+ROLE_FILTER=""
+JSON_OUTPUT=false
+
+# Colors
+BLUE="\033[94m"
+GREEN="\033[92m"
+YELLOW="\033[93m"
+CYAN="\033[96m"
+GRAY="\033[90m"
+RESET="\033[0m"
+BOLD="\033[1m"
+
+usage() {
+    echo "Usage: list-agents [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --role ROLE     Filter by role (worker, verifier, supervisor)"
+    echo "  --json          Output as JSON array"
+    echo "  --help          Show this help"
+    exit 0
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --role|-r)
+            ROLE_FILTER="$2"
+            shift 2
+            ;;
+        --json|-j)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Check if registry exists
+if [[ ! -d "$REGISTRY_DIR" ]]; then
+    echo "No agents registered yet."
+    exit 0
+fi
+
+# Collect agents
+agents=()
+for file in "$REGISTRY_DIR"/*.json; do
+    [[ -f "$file" ]] || continue
+
+    if [[ -n "$ROLE_FILTER" ]]; then
+        role=$(jq -r '.role' "$file")
+        [[ "$role" == "$ROLE_FILTER" ]] || continue
+    fi
+
+    agents+=("$file")
+done
+
+if [[ ${#agents[@]} -eq 0 ]]; then
+    if [[ -n "$ROLE_FILTER" ]]; then
+        echo "No agents found with role: $ROLE_FILTER"
+    else
+        echo "No agents registered yet."
+    fi
+    exit 0
+fi
+
+# JSON output
+if $JSON_OUTPUT; then
+    jq -s '.' "${agents[@]}"
+    exit 0
+fi
+
+# Pretty output
+echo -e "${BOLD}Registered Agents${RESET}"
+echo -e "${GRAY}─────────────────────────────────────────────────────────${RESET}"
+printf "${BOLD}%-12s %-20s %-10s %-10s %-10s${RESET}\n" "ID" "MODEL" "PROVIDER" "ROLE" "STATUS"
+echo -e "${GRAY}─────────────────────────────────────────────────────────${RESET}"
+
+for file in "${agents[@]}"; do
+    id=$(jq -r '.id' "$file")
+    model=$(jq -r '.model' "$file")
+    provider=$(jq -r '.provider' "$file")
+    role=$(jq -r '.role' "$file")
+    status=$(jq -r '.status' "$file")
+
+    # Color based on role
+    case $role in
+        supervisor) color="$YELLOW" ;;
+        verifier)   color="$CYAN" ;;
+        worker)     color="$GREEN" ;;
+        *)          color="$GRAY" ;;
+    esac
+
+    # Status indicator
+    case $status in
+        available) status_icon="●" ;;
+        busy)      status_icon="◐" ;;
+        offline)   status_icon="○" ;;
+        *)         status_icon="?" ;;
+    esac
+
+    printf "${color}%-12s${RESET} %-20s %-10s %-10s ${color}%s %s${RESET}\n" \
+        "$id" "$model" "$provider" "$role" "$status_icon" "$status"
+done
+
+echo -e "${GRAY}─────────────────────────────────────────────────────────${RESET}"
+echo -e "${GRAY}Total: ${#agents[@]} agent(s)${RESET}"
