@@ -1,0 +1,90 @@
+#!/bin/bash
+#
+# set-typing - Write typing indicator JSON for an agent
+#
+# Usage:
+#   set-typing
+#   set-typing --from claude --session collab-demo
+#
+# Environment:
+#   COLLAB_SESSION - Session ID (or use --session)
+#   COLLAB_AGENT   - Agent name (or use --from)
+#   COLLAB_TTL_MS  - TTL in ms (default: 3000)
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+
+SESSION="${COLLAB_SESSION:-}"
+AGENT="${COLLAB_AGENT:-}"
+TTL_MS="${COLLAB_TTL_MS:-3000}"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --session|-s)
+            SESSION="$2"
+            shift 2
+            ;;
+        --from|-f)
+            AGENT="$2"
+            shift 2
+            ;;
+        --ttl)
+            TTL_MS="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: set-typing [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --session, -s SESSION   Session ID (or set COLLAB_SESSION)"
+            echo "  --from, -f AGENT        Agent name (or set COLLAB_AGENT)"
+            echo "  --ttl TTL_MS            TTL in ms (default: 3000 or COLLAB_TTL_MS)"
+            exit 0
+            ;;
+        -* )
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        * )
+            echo "Unexpected argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$SESSION" ]]; then
+    echo "Error: No session specified. Set COLLAB_SESSION or use --session" >&2
+    exit 1
+fi
+
+if [[ -z "$AGENT" ]]; then
+    echo "Error: No agent specified. Set COLLAB_AGENT or use --from" >&2
+    exit 1
+fi
+
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+TYPING_DIR="${COLLAB_DIR}/signals/typing"
+mkdir -p "$TYPING_DIR"
+
+TYPING_JSON=$(jq -n \
+    --arg agent "$AGENT" \
+    --arg status "typing" \
+    --arg timestamp "$TIMESTAMP" \
+    --arg session "$SESSION" \
+    --argjson ttl_ms "$TTL_MS" \
+    '{
+        agent: $agent,
+        status: $status,
+        timestamp: $timestamp,
+        ttl_ms: $ttl_ms,
+        session: $session
+    }')
+
+TMP_FILE="${TYPING_DIR}/.${AGENT}.json.tmp"
+FINAL_FILE="${TYPING_DIR}/${AGENT}.json"
+
+echo "$TYPING_JSON" > "$TMP_FILE"
+mv "$TMP_FILE" "$FINAL_FILE"

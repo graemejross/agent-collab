@@ -1,0 +1,48 @@
+#!/bin/bash
+#
+# clear-typing - Remove typing indicator JSON for an agent
+#
+# Usage:
+#   clear-typing
+#   clear-typing --from claude
+#
+# Environment:
+#   COLLAB_AGENT - Agent name (or use --from)
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+AGENT="${COLLAB_AGENT:-}"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --from|-f)
+            AGENT="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: clear-typing [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --from, -f AGENT        Agent name (or set COLLAB_AGENT)"
+            exit 0
+            ;;
+        -* )
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        * )
+            echo "Unexpected argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$AGENT" ]]; then
+    echo "Error: No agent specified. Set COLLAB_AGENT or use --from" >&2
+    exit 1
+fi
+
+TYPING_FILE="${COLLAB_DIR}/signals/typing/${AGENT}.json"
+rm -f "$TYPING_FILE"
