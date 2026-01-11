@@ -1,7 +1,7 @@
 {
   "id": "docs-1",
-  "model": "claude-3-5-haiku-20241022",
-  "provider": "anthropic",
+  "model": "gemini-2.5-flash",
+  "provider": "google",
   "capabilities": [
     "documentation-management",
     "quality-review",
@@ -12,7 +12,7 @@
   "role": "manager",
   "status": "active",
   "registered": "2026-01-11T15:40:00Z",
-  "cost_tier": 2,
+  "cost_tier": 1,
   "manages": ["docs-2"],
   "guardrails": {
     "docs_only": true,

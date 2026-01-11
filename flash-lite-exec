@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#
+# flash-lite-exec - Execute a prompt with Gemini Flash-Lite (cheapest tier)
+#
+# Usage:
+#     flash-lite-exec "prompt text"
+#     echo "prompt text" | flash-lite-exec
+#
+# This is a wrapper around gemini-exec that uses the Flash-Lite model
+# for maximum cost efficiency on simple tasks.
+#
+# Cost: ~$0.005/1K tokens (vs $0.01/1K for Flash, $0.08/1K for Haiku)
+#
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+exec "$SCRIPT_DIR/gemini-exec" --model "gemini-2.5-flash-lite" "$@"

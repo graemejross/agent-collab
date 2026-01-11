@@ -1,0 +1,31 @@
+{
+  "id": "triage-1",
+  "model": "gemini-2.5-flash-lite",
+  "provider": "google",
+  "capabilities": [
+    "incident-classification",
+    "severity-assessment",
+    "routing",
+    "diagnostics",
+    "alerting"
+  ],
+  "role": "verifier",
+  "status": "active",
+  "registered": "2026-01-11T15:45:00Z",
+  "cost_tier": 1,
+  "guardrails": {
+    "read_only": true,
+    "allowed_log_paths": [
+      "/mnt/shared/collab/logs/*.log",
+      "~/claude-logs/*.log"
+    ],
+    "cannot": ["fix_issues", "restart_services", "modify_configs", "access_production_db"]
+  },
+  "routing_rules": {
+    "P1": ["human", "supervisor"],
+    "P2": ["supervisor"],
+    "P3": ["relevant_agent"],
+    "P4": ["docs-1"]
+  },
+  "notes": "Incident Triage agent. Rapid classification P1-P4, routes to appropriate handler. Read-only diagnostics."
+}

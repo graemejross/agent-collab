@@ -2,7 +2,7 @@
 #
 # docs-watcher - Documentation Steward agent watcher
 #
-# Uses Claude Haiku for documentation tasks:
+# Uses Gemini Flash for documentation tasks (8x cheaper than Haiku):
 # - Maintaining CURRENT-STATE.md
 # - Generating handoff notes
 # - Syncing to Notion
@@ -151,7 +151,7 @@ If asked to sync to Notion, confirm the files and await verification."
     log_info "Invoking docs agent for message from ${from}..."
 
     local response
-    response=$("${SCRIPTS_DIR}/haiku-exec" "$prompt" 2>&1) || {
+    response=$("${SCRIPTS_DIR}/gemini-exec" "$prompt" 2>&1) || {
         log_err "Docs invocation failed: $response"
         return 1
     }
@@ -187,7 +187,7 @@ msg = {
     },
     "metadata": {
         "mode": "watcher",
-        "model": "claude-3-5-haiku-20241022",
+        "model": "gemini-2.5-flash",
         "role": "documentation_steward",
         "in_reply_to": "${in_reply_to}"
     }
@@ -211,8 +211,8 @@ main() {
         exit 1
     fi
 
-    if [[ ! -x "${SCRIPTS_DIR}/haiku-exec" ]]; then
-        log_err "haiku-exec not found or not executable"
+    if [[ ! -x "${SCRIPTS_DIR}/gemini-exec" ]]; then
+        log_err "gemini-exec not found or not executable"
         exit 1
     fi
 

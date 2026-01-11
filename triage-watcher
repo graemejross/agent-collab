@@ -2,7 +2,7 @@
 #
 # triage-watcher - Incident Triage agent watcher
 #
-# Uses Gemini Flash for rapid incident classification:
+# Uses Gemini Flash-Lite for rapid incident classification (cheapest tier):
 # - Severity assessment (P1-P4)
 # - Routing to appropriate agent/human
 # - Initial diagnostics gathering
@@ -194,7 +194,7 @@ ESCALATION: (conditions that would escalate severity)"
     log_info "Invoking triage for incident from ${from}..."
 
     local response
-    response=$("${SCRIPTS_DIR}/gemini-exec" "$prompt" 2>&1) || {
+    response=$("${SCRIPTS_DIR}/flash-lite-exec" "$prompt" 2>&1) || {
         log_err "Triage invocation failed: $response"
         return 1
     }
@@ -230,7 +230,7 @@ msg = {
     },
     "metadata": {
         "mode": "watcher",
-        "model": "gemini-2.5-flash",
+        "model": "gemini-2.5-flash-lite",
         "role": "incident_triage",
         "in_reply_to": "${in_reply_to}"
     }
@@ -254,8 +254,8 @@ main() {
         exit 1
     fi
 
-    if [[ ! -x "${SCRIPTS_DIR}/gemini-exec" ]]; then
-        log_err "gemini-exec not found or not executable"
+    if [[ ! -x "${SCRIPTS_DIR}/flash-lite-exec" ]]; then
+        log_err "flash-lite-exec not found or not executable"
         exit 1
     fi
 
