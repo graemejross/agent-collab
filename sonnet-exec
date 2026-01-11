@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""
+sonnet-exec - Execute a prompt using Claude Sonnet
+
+Usage:
+    sonnet-exec "Your prompt here"
+    sonnet-exec --model claude-sonnet-4-20250514 "Your prompt"
+    echo "prompt" | sonnet-exec
+
+Environment:
+    ANTHROPIC_API_KEY - API key (or source ~/.credentials)
+"""
+
+import argparse
+import os
+import sys
+
+def main():
+    parser = argparse.ArgumentParser(description="Execute prompt with Claude Sonnet")
+    parser.add_argument("prompt", nargs="?", help="The prompt to send")
+    parser.add_argument("--model", "-m", default="claude-sonnet-4-20250514",
+                        help="Model to use (default: claude-sonnet-4-20250514)")
+    parser.add_argument("--max-tokens", "-t", type=int, default=4096,
+                        help="Max tokens in response (default: 4096)")
+    args = parser.parse_args()
+
+    # Get prompt from args or stdin
+    if args.prompt:
+        prompt = args.prompt
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+    else:
+        print("Error: No prompt provided", file=sys.stderr)
+        sys.exit(1)
+
+    # Load credentials if not in environment
+    if "ANTHROPIC_API_KEY" not in os.environ:
+        cred_file = os.path.expanduser("~/.credentials")
+        if os.path.exists(cred_file):
+            with open(cred_file) as f:
+                for line in f:
+                    if line.startswith("export ANTHROPIC_API_KEY="):
+                        key = line.split("=", 1)[1].strip().strip('"\'')
+                        os.environ["ANTHROPIC_API_KEY"] = key
+                        break
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("Error: ANTHROPIC_API_KEY not found", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        import anthropic
+    except ImportError:
+        print("Error: anthropic package not installed. Run: pip install anthropic", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+
+        message = client.messages.create(
+            model=args.model,
+            max_tokens=args.max_tokens,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        # Extract text from response
+        if message.content:
+            for block in message.content:
+                if hasattr(block, 'text'):
+                    print(block.text)
+
+    except anthropic.APIError as e:
+        print(f"API Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
