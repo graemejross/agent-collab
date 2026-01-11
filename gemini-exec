@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""
+gemini-exec - Execute a prompt with Gemini API
+
+Usage:
+    gemini-exec "prompt text"
+    echo "prompt text" | gemini-exec
+    gemini-exec --model gemini-2.0-flash "prompt"
+
+Environment:
+    GEMINI_API_KEY - API key (or source ~/.credentials)
+
+Models:
+    gemini-2.0-flash (default) - Fast, cheap
+    gemini-1.5-flash - Faster, cheaper
+    gemini-1.5-pro - More capable
+"""
+
+import os
+import sys
+import argparse
+import warnings
+
+# Suppress the deprecation warning
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+def load_credentials():
+    """Load API key from environment or credentials file."""
+    if os.environ.get("GEMINI_API_KEY"):
+        return os.environ["GEMINI_API_KEY"]
+
+    # Try loading from ~/.credentials
+    creds_file = os.path.expanduser("~/.credentials")
+    if os.path.exists(creds_file):
+        with open(creds_file) as f:
+            for line in f:
+                if line.startswith("export GEMINI_API_KEY="):
+                    # Extract value, handling quotes
+                    value = line.split("=", 1)[1].strip()
+                    value = value.strip('"').strip("'")
+                    return value
+
+    return None
+
+def main():
+    parser = argparse.ArgumentParser(description="Execute a prompt with Gemini")
+    parser.add_argument("prompt", nargs="?", help="Prompt text (or read from stdin)")
+    parser.add_argument("--model", "-m", default="gemini-2.5-flash",
+                        help="Model to use (default: gemini-2.5-flash)")
+    parser.add_argument("--json", "-j", action="store_true",
+                        help="Output as JSON")
+    args = parser.parse_args()
+
+    # Get API key
+    api_key = load_credentials()
+    if not api_key:
+        print("Error: GEMINI_API_KEY not found", file=sys.stderr)
+        print("Set it in environment or ~/.credentials", file=sys.stderr)
+        sys.exit(1)
+
+    # Get prompt
+    if args.prompt:
+        prompt = args.prompt
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+    else:
+        print("Error: No prompt provided", file=sys.stderr)
+        sys.exit(1)
+
+    # Configure and call Gemini
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(args.model)
+
+        response = model.generate_content(prompt)
+
+        if args.json:
+            import json
+            output = {
+                "model": args.model,
+                "response": response.text,
+                "prompt_tokens": getattr(response.usage_metadata, 'prompt_token_count', None),
+                "response_tokens": getattr(response.usage_metadata, 'candidates_token_count', None),
+            }
+            print(json.dumps(output, indent=2))
+        else:
+            print(response.text)
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

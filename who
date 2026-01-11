@@ -1,0 +1,125 @@
+#!/bin/bash
+#
+# who - Check which agents are currently awake
+#
+# Usage:
+#   who              # Show all agents
+#   who codex-1      # Show specific agent
+#
+# Reads presence files from /mnt/shared/collab/presence/
+#
+
+PRESENCE_DIR="/mnt/shared/collab/presence"
+REGISTRY_DIR="/mnt/shared/collab/registry"
+STALE_THRESHOLD=300  # 5 minutes = stale
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+GRAY='\033[0;90m'
+NC='\033[0m'
+BOLD='\033[1m'
+
+now=$(date +%s)
+
+show_agent() {
+    local agent_id="$1"
+    local presence_file="${PRESENCE_DIR}/${agent_id}.json"
+
+    if [[ ! -f "$presence_file" ]]; then
+        printf "  ${GRAY}%-12s${NC} ${RED}NO PRESENCE${NC}\n" "$agent_id"
+        return
+    fi
+
+    local state=$(jq -r '.state // "UNKNOWN"' "$presence_file")
+    local substate=$(jq -r '.substate // ""' "$presence_file")
+    local timestamp=$(jq -r '.timestamp // ""' "$presence_file")
+    local channel=$(jq -r '.channel // ""' "$presence_file")
+    local pid=$(jq -r '.watcher_pid // ""' "$presence_file")
+
+    # Calculate age
+    local age_str="?"
+    if [[ -n "$timestamp" ]]; then
+        local ts_epoch=$(date -d "$timestamp" +%s 2>/dev/null || echo 0)
+        local age=$((now - ts_epoch))
+
+        if [[ $age -lt 60 ]]; then
+            age_str="${age}s ago"
+        elif [[ $age -lt 3600 ]]; then
+            age_str="$((age / 60))m ago"
+        else
+            age_str="$((age / 3600))h ago"
+        fi
+
+        # Mark as stale if too old
+        if [[ $age -gt $STALE_THRESHOLD && "$state" == "AWAKE" ]]; then
+            state="STALE"
+        fi
+    fi
+
+    # Color based on state
+    local state_color
+    case $state in
+        AWAKE)   state_color="$GREEN" ;;
+        STALE)   state_color="$YELLOW" ;;
+        OFFLINE) state_color="$RED" ;;
+        *)       state_color="$GRAY" ;;
+    esac
+
+    # Format substate
+    local status="${state}"
+    if [[ -n "$substate" && "$substate" != "null" ]]; then
+        status="${state}/${substate}"
+    fi
+
+    # Check if watcher process is running
+    local watcher_status=""
+    if [[ -n "$pid" && "$pid" != "null" ]]; then
+        if kill -0 "$pid" 2>/dev/null; then
+            watcher_status="${GREEN}[watcher:${pid}]${NC}"
+        else
+            watcher_status="${RED}[watcher:dead]${NC}"
+        fi
+    fi
+
+    printf "  ${BOLD}%-12s${NC} ${state_color}%-15s${NC} ${GRAY}%-10s${NC} ${BLUE}%-20s${NC} %b\n" \
+        "$agent_id" "$status" "$age_str" "$channel" "$watcher_status"
+}
+
+echo ""
+echo -e "${BOLD}AGENT STATUS${NC}"
+echo -e "${GRAY}─────────────────────────────────────────────────────────────────${NC}"
+printf "  ${GRAY}%-12s %-15s %-10s %-20s %s${NC}\n" "AGENT" "STATE" "LAST SEEN" "CHANNEL" "WATCHER"
+echo -e "${GRAY}─────────────────────────────────────────────────────────────────${NC}"
+
+if [[ -n "$1" ]]; then
+    # Show specific agent
+    show_agent "$1"
+else
+    # Show all known agents
+    # First from presence files
+    for f in "${PRESENCE_DIR}"/*.json; do
+        [[ -f "$f" ]] || continue
+        agent_id=$(basename "$f" .json)
+        show_agent "$agent_id"
+    done
+
+    # Then check registry for agents without presence
+    if [[ -d "${REGISTRY_DIR}/agents" ]]; then
+        for f in "${REGISTRY_DIR}/agents"/*.json; do
+            [[ -f "$f" ]] || continue
+            agent_id=$(jq -r '.id // ""' "$f")
+            [[ -z "$agent_id" ]] && continue
+
+            # Skip if already shown
+            [[ -f "${PRESENCE_DIR}/${agent_id}.json" ]] && continue
+
+            printf "  ${GRAY}%-12s${NC} ${RED}OFFLINE${NC}         ${GRAY}(no presence file)${NC}\n" "$agent_id"
+        done
+    fi
+fi
+
+echo -e "${GRAY}─────────────────────────────────────────────────────────────────${NC}"
+echo ""

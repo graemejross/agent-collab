@@ -1,19 +1,19 @@
 #!/bin/bash
 #
-# codex-watcher - Persistent watcher that makes Codex respond to channel messages
+# gemini-watcher - Persistent watcher that makes Gemini respond to channel messages
 #
 # This script:
 # 1. Watches the channel for new messages using inotifywait (zero AI tokens)
-# 2. When a message is addressed to codex-1, gathers context
-# 3. Invokes Codex with the context
-# 4. Posts Codex's response back to the channel
+# 2. When a message is addressed to gemini-1, gathers context
+# 3. Invokes Gemini via gemini-exec
+# 4. Posts Gemini's response back to the channel
 #
 # Usage:
-#   codex-watcher <channel>
-#   codex-watcher aqara-trv-automation
+#   gemini-watcher <channel>
+#   gemini-watcher aqara-trv-automation
 #
 # Run in tmux for persistence:
-#   tmux new-session -d -s codex-watcher './codex-watcher aqara-trv-automation'
+#   tmux new-session -d -s gemini-watcher './gemini-watcher aqara-trv-automation'
 #
 
 set -e
@@ -21,15 +21,15 @@ set -e
 CHANNEL="${1:-aqara-trv-automation}"
 CHANNEL_DIR="/mnt/shared/collab/channels/${CHANNEL}"
 PRESENCE_DIR="/mnt/shared/collab/presence"
-AGENT="codex-1"
-CODEX_VM="100.88.166.68"
-LOG_FILE="/mnt/shared/collab/logs/codex-watcher.log"
+SCRIPTS_DIR="/mnt/shared/collab/scripts"
+AGENT="gemini-1"
+LOG_FILE="/mnt/shared/collab/logs/gemini-watcher.log"
 
 # Colors for terminal output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 log() {
@@ -38,7 +38,7 @@ log() {
     echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
-log_info() { log "${BLUE}INFO${NC}: $1"; }
+log_info() { log "${MAGENTA}INFO${NC}: $1"; }
 log_ok() { log "${GREEN}OK${NC}: $1"; }
 log_warn() { log "${YELLOW}WARN${NC}: $1"; }
 log_err() { log "${RED}ERROR${NC}: $1"; }
@@ -67,14 +67,14 @@ is_for_us() {
     local to=$(jq -r '.to // "all"' "$file" 2>/dev/null)
     local mentions=$(jq -r '.content.text // ""' "$file" 2>/dev/null | grep -o "@${AGENT}" || true)
 
-    [[ "$to" == "$AGENT" ]] || [[ "$to" == "codex-1" ]] || [[ -n "$mentions" ]]
+    [[ "$to" == "$AGENT" ]] || [[ "$to" == "gemini-1" ]] || [[ -n "$mentions" ]]
 }
 
 # Check if message is from us (don't respond to ourselves)
 is_from_us() {
     local file="$1"
     local from=$(jq -r '.from // ""' "$file" 2>/dev/null)
-    [[ "$from" == "$AGENT" ]] || [[ "$from" == "codex-1" ]]
+    [[ "$from" == "$AGENT" ]] || [[ "$from" == "gemini-1" ]]
 }
 
 # Get recent context (last N messages)
@@ -104,19 +104,16 @@ get_memory() {
     echo -e "$memory"
 }
 
-# Invoke Codex and get response
-invoke_codex() {
+# Invoke Gemini and get response
+invoke_gemini() {
     local message_file="$1"
     local from=$(jq -r '.from' "$message_file")
     local text=$(jq -r '.content.text // ""' "$message_file")
-    local msg_type=$(jq -r '.type // "chat"' "$message_file")
     local context=$(get_context 10)
     local memory=$(get_memory)
 
-    # Write prompt to shared location (avoids shell escaping issues)
-    local prompt_file="/mnt/shared/collab/workspace/.codex-prompt-$$.txt"
-    cat > "$prompt_file" << PROMPT_EOF
-You are codex-1 in a multi-agent collaboration system. You're responding to a message in the ${CHANNEL} channel.
+    # Build prompt
+    local prompt="You are gemini-1 in a multi-agent collaboration system. You're responding to a message in the ${CHANNEL} channel.
 
 ${memory}
 
@@ -128,67 +125,19 @@ ${text}
 
 Respond appropriately. Keep your response focused and concise.
 - You have access to CURRENT-STATE.md above - use it for context about past discussions
-- Do NOT run startup scripts
-- Do NOT ask about projects
-- Just respond to the message directly
-- Output ONLY your response text
-PROMPT_EOF
+- You are Gemini, a different model from Claude and Codex
+- Your role is often as a validator/challenger - provide independent perspective
+- Output ONLY your response text, nothing else"
 
-    # Invoke Codex on the remote VM, reading prompt from shared file
-    log_info "Invoking Codex for message from ${from}..."
+    log_info "Invoking Gemini for message from ${from}..."
 
     local response
-    response=$(ssh graeme@${CODEX_VM} "codex exec --skip-git-repo-check --sandbox danger-full-access \"\$(cat ${prompt_file})\"" 2>&1) || {
-        log_err "Codex invocation failed: $response"
-        rm -f "$prompt_file"
+    response=$("${SCRIPTS_DIR}/gemini-exec" "$prompt" 2>&1) || {
+        log_err "Gemini invocation failed: $response"
         return 1
     }
 
-    rm -f "$prompt_file"
-
-    # Extract just the response (remove Codex metadata, token count, duplicates)
-    # Write response to temp file, then process with Python
-    local response_file="/tmp/.codex-response-$$.txt"
-    echo "$response" > "$response_file"
-
-    python3 << PYEOF
-import re
-
-with open("$response_file", "r") as f:
-    content = f.read()
-
-# Remove ANSI escape codes
-content = re.sub(r'\x1b\[[0-9;]*m', '', content)
-
-# Extract text between "codex" and "tokens used"
-match = re.search(r'^codex\n(.*?)^tokens used', content, re.MULTILINE | re.DOTALL)
-if not match:
-    match = re.search(r'^codex\n(.*)$', content, re.MULTILINE | re.DOTALL)
-    text = match.group(1).strip() if match else ""
-else:
-    text = match.group(1).strip()
-
-# Filter out log/metadata lines
-lines = [line for line in text.split('\n')
-         if line.strip() and not line.strip().startswith('[')
-         and 'INFO' not in line and 'Invoking' not in line]
-text = '\n'.join(lines)
-
-# Deduplicate: if text is exactly repeated, keep only first half
-if text:
-    half = len(text) // 2
-    first_half = text[:half].strip()
-    second_half = text[half:].strip()
-    if first_half and second_half:
-        if ' '.join(first_half.split()) == ' '.join(second_half.split()):
-            text = first_half
-
-# Output (limit to 20 lines)
-for line in text.split('\n')[:20]:
-    print(line)
-PYEOF
-
-    rm -f "$response_file"
+    echo "$response"
 }
 
 # Post response to channel
@@ -204,13 +153,13 @@ from pathlib import Path
 import secrets
 
 now = datetime.now(timezone.utc)
-msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-codex-{secrets.token_hex(2)}"
+msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-gemini-{secrets.token_hex(2)}"
 
 msg = {
     "id": msg_id,
     "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
     "session_id": "${CHANNEL}",
-    "from": "codex-1",
+    "from": "gemini-1",
     "to": "all",
     "type": "chat",
     "content": {
@@ -220,6 +169,7 @@ msg = {
     },
     "metadata": {
         "mode": "watcher",
+        "model": "gemini-2.5-flash",
         "in_reply_to": "${in_reply_to}"
     }
 }
@@ -232,7 +182,7 @@ EOF
 
 # Main watch loop
 main() {
-    log_info "Starting Codex watcher for channel: ${CHANNEL}"
+    log_info "Starting Gemini watcher for channel: ${CHANNEL}"
     log_info "Watching: ${CHANNEL_DIR}"
     log_info "Press Ctrl+C to stop"
 
@@ -244,6 +194,11 @@ main() {
 
     if ! command -v jq &> /dev/null; then
         log_err "jq not found. Install with: apt install jq"
+        exit 1
+    fi
+
+    if [[ ! -x "${SCRIPTS_DIR}/gemini-exec" ]]; then
+        log_err "gemini-exec not found or not executable"
         exit 1
     fi
 
@@ -292,17 +247,17 @@ main() {
         # Get the message ID for reply tracking
         local msg_id=$(jq -r '.id' "$filepath" 2>/dev/null)
 
-        # Invoke Codex and get response
+        # Invoke Gemini and get response
         local response
-        if response=$(invoke_codex "$filepath"); then
+        if response=$(invoke_gemini "$filepath"); then
             if [[ -n "$response" ]]; then
-                log_ok "Got response from Codex"
+                log_ok "Got response from Gemini"
                 post_response "$response" "$msg_id"
             else
-                log_warn "Empty response from Codex"
+                log_warn "Empty response from Gemini"
             fi
         else
-            log_err "Failed to get response from Codex"
+            log_err "Failed to get response from Gemini"
         fi
 
         update_presence "IDLE"
