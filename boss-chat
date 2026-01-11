@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+boss-chat - Interactive chat interface for the supervisor
+
+A terminal UI for talking to the supervisor agent, similar to Claude Code's interface.
+Shows conversation history and allows sending commands.
+
+Usage:
+    boss-chat              # Interactive mode
+    boss-chat "status"     # Send single command and show response
+
+Commands:
+    status          - Get team status
+    help            - Show available commands
+    clear           - Clear screen
+    quit/exit       - Exit chat
+    (anything else) - Send as directive to supervisor
+"""
+
+import sys
+import os
+import json
+import time
+import threading
+from pathlib import Path
+from datetime import datetime
+
+# Add rich for nice formatting
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.markdown import Markdown
+    from rich.text import Text
+    from rich.live import Live
+    from rich.table import Table
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+    print("Note: Install 'rich' for better formatting: pip install rich")
+
+COLLAB_DIR = Path("/mnt/shared/collab")
+CHANNEL_DIR = COLLAB_DIR / "channels" / "human-supervisor"
+SCRIPTS_DIR = COLLAB_DIR / "scripts"
+
+console = Console() if RICH_AVAILABLE else None
+
+def send_message(text: str) -> str:
+    """Send a message to the supervisor channel."""
+    import subprocess
+    result = subprocess.run(
+        [str(SCRIPTS_DIR / "send-message"),
+         "--session", "human-supervisor",
+         "--from", "human",
+         text],
+        capture_output=True,
+        text=True
+    )
+    return result.stdout
+
+def get_recent_messages(n: int = 20) -> list:
+    """Get recent messages from the channel."""
+    messages = []
+    msg_files = sorted(CHANNEL_DIR.glob("msg-*.json"), reverse=True)[:n]
+
+    for f in reversed(msg_files):
+        try:
+            with open(f) as fp:
+                msg = json.load(fp)
+                messages.append({
+                    'id': msg.get('id', ''),
+                    'from': msg.get('from', 'unknown'),
+                    'text': msg.get('content', {}).get('text', ''),
+                    'timestamp': msg.get('timestamp', ''),
+                })
+        except:
+            pass
+
+    return messages
+
+def wait_for_response(after_id: str, timeout: int = 60) -> dict:
+    """Wait for a supervisor response after our message."""
+    start = time.time()
+    seen = set()
+
+    # Mark existing messages as seen
+    for f in CHANNEL_DIR.glob("msg-*.json"):
+        seen.add(f.name)
+
+    while time.time() - start < timeout:
+        for f in CHANNEL_DIR.glob("msg-*.json"):
+            if f.name not in seen:
+                seen.add(f.name)
+                try:
+                    with open(f) as fp:
+                        msg = json.load(fp)
+                        if msg.get('from') == 'supervisor':
+                            return {
+                                'from': 'supervisor',
+                                'text': msg.get('content', {}).get('text', ''),
+                                'timestamp': msg.get('timestamp', ''),
+                            }
+                except:
+                    pass
+        time.sleep(0.5)
+
+    return None
+
+def format_message(msg: dict) -> None:
+    """Display a formatted message."""
+    sender = msg.get('from', 'unknown')
+    text = msg.get('text', '')
+
+    if RICH_AVAILABLE:
+        if sender == 'human':
+            console.print(Panel(
+                text,
+                title="[bold yellow]You[/bold yellow]",
+                border_style="yellow",
+                padding=(0, 1)
+            ))
+        elif sender == 'supervisor':
+            console.print(Panel(
+                Markdown(text),
+                title="[bold cyan]Supervisor[/bold cyan]",
+                border_style="cyan",
+                padding=(0, 1)
+            ))
+        else:
+            console.print(f"[dim]{sender}:[/dim] {text}")
+    else:
+        prefix = ">>> " if sender == 'human' else "<<< "
+        print(f"\n{prefix}[{sender}]")
+        print(text)
+        print()
+
+def show_history(n: int = 10) -> None:
+    """Show recent conversation history."""
+    messages = get_recent_messages(n)
+
+    if RICH_AVAILABLE:
+        console.print("\n[dim]─── Recent Conversation ───[/dim]\n")
+    else:
+        print("\n--- Recent Conversation ---\n")
+
+    for msg in messages[-n:]:
+        format_message(msg)
+
+def show_help() -> None:
+    """Show help information."""
+    help_text = """
+**Available Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `status` | Get team status from supervisor |
+| `history` | Show recent conversation |
+| `clear` | Clear the screen |
+| `help` | Show this help |
+| `quit` | Exit the chat |
+
+**Talking to Supervisor:**
+
+Just type your message and press Enter. Examples:
+- "What agents are available?"
+- "Have claude-1 review the security docs"
+- "Assign codex-1 to write a hello world script"
+
+**Tips:**
+- Supervisor decomposes tasks and assigns to workers
+- Use `status` to see what's happening
+- Supervisor will escalate issues to you
+"""
+    if RICH_AVAILABLE:
+        console.print(Panel(Markdown(help_text), title="Help", border_style="green"))
+    else:
+        print(help_text)
+
+def clear_screen() -> None:
+    """Clear the terminal screen."""
+    os.system('clear' if os.name != 'nt' else 'cls')
+
+def interactive_mode() -> None:
+    """Run the interactive chat interface."""
+    clear_screen()
+
+    if RICH_AVAILABLE:
+        console.print(Panel(
+            "[bold]Boss Chat[/bold] - Talk to your AI team supervisor\n"
+            "Type [cyan]help[/cyan] for commands, [cyan]quit[/cyan] to exit",
+            border_style="blue"
+        ))
+    else:
+        print("=== Boss Chat ===")
+        print("Talk to your AI team supervisor")
+        print("Type 'help' for commands, 'quit' to exit\n")
+
+    # Show recent history
+    show_history(5)
+
+    while True:
+        try:
+            if RICH_AVAILABLE:
+                console.print()
+                user_input = console.input("[bold yellow]You:[/bold yellow] ").strip()
+            else:
+                user_input = input("\nYou: ").strip()
+
+            if not user_input:
+                continue
+
+            # Handle special commands
+            cmd = user_input.lower()
+
+            if cmd in ('quit', 'exit', 'q'):
+                if RICH_AVAILABLE:
+                    console.print("[dim]Goodbye![/dim]")
+                else:
+                    print("Goodbye!")
+                break
+
+            elif cmd == 'help':
+                show_help()
+                continue
+
+            elif cmd == 'clear':
+                clear_screen()
+                continue
+
+            elif cmd == 'history':
+                show_history(15)
+                continue
+
+            # Send message to supervisor
+            if RICH_AVAILABLE:
+                with console.status("[cyan]Sending to supervisor...[/cyan]"):
+                    send_message(user_input)
+            else:
+                print("Sending...")
+                send_message(user_input)
+
+            # Wait for response
+            if RICH_AVAILABLE:
+                with console.status("[cyan]Waiting for supervisor...[/cyan]"):
+                    response = wait_for_response("", timeout=60)
+            else:
+                print("Waiting for response...")
+                response = wait_for_response("", timeout=60)
+
+            if response:
+                format_message(response)
+            else:
+                if RICH_AVAILABLE:
+                    console.print("[dim]No response received (timeout)[/dim]")
+                else:
+                    print("(No response received)")
+
+        except KeyboardInterrupt:
+            print("\n")
+            if RICH_AVAILABLE:
+                console.print("[dim]Use 'quit' to exit[/dim]")
+            else:
+                print("Use 'quit' to exit")
+
+        except EOFError:
+            break
+
+def single_command(cmd: str) -> None:
+    """Send a single command and show the response."""
+    if RICH_AVAILABLE:
+        console.print(f"[yellow]Sending:[/yellow] {cmd}")
+    else:
+        print(f"Sending: {cmd}")
+
+    send_message(cmd)
+
+    if RICH_AVAILABLE:
+        with console.status("[cyan]Waiting for supervisor...[/cyan]"):
+            response = wait_for_response("", timeout=60)
+    else:
+        print("Waiting...")
+        response = wait_for_response("", timeout=60)
+
+    if response:
+        format_message(response)
+    else:
+        print("No response received")
+
+def main():
+    # Ensure channel exists
+    CHANNEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    if len(sys.argv) > 1:
+        # Single command mode
+        cmd = " ".join(sys.argv[1:])
+        single_command(cmd)
+    else:
+        # Interactive mode
+        interactive_mode()
+
+if __name__ == "__main__":
+    main()
