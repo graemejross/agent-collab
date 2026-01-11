@@ -45,10 +45,13 @@ SCRIPTS_DIR = COLLAB_DIR / "scripts"
 
 console = Console() if RICH_AVAILABLE else None
 
-def get_team_activity(since_timestamp: str = None, n: int = 5) -> list:
-    """Get recent messages from team channel."""
+def get_team_activity(since_timestamp: str = None, n: int = 5, max_age_minutes: int = 5) -> list:
+    """Get recent messages from team channel (within max_age_minutes)."""
     messages = []
     msg_files = sorted(TEAM_CHANNEL_DIR.glob("msg-*.json"), reverse=True)[:20]
+
+    # Calculate cutoff time
+    cutoff = datetime.utcnow().replace(tzinfo=None) - __import__('datetime').timedelta(minutes=max_age_minutes)
 
     for f in reversed(msg_files):
         try:
@@ -62,6 +65,15 @@ def get_team_activity(since_timestamp: str = None, n: int = 5) -> list:
                     continue
 
                 ts = msg.get('timestamp', '')
+
+                # Skip messages older than max_age_minutes
+                try:
+                    msg_time = datetime.fromisoformat(ts.replace('Z', '+00:00')).replace(tzinfo=None)
+                    if msg_time < cutoff:
+                        continue
+                except:
+                    pass
+
                 if since_timestamp and ts <= since_timestamp:
                     continue
 
