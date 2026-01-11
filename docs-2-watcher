@@ -1,0 +1,302 @@
+#!/bin/bash
+#
+# docs-2-watcher - Documentation worker agent watcher
+#
+# Uses Gemini Flash for documentation tasks with script execution:
+# - Notion uploads/downloads
+# - Documentation drafting
+# - Bulk operations
+#
+# Reports to docs-1 (manager)
+#
+
+set -e
+
+CHANNEL="${1:-agent-os-paper}"
+CHANNEL_DIR="/mnt/shared/collab/channels/${CHANNEL}"
+PRESENCE_DIR="/mnt/shared/collab/presence"
+SCRIPTS_DIR="/mnt/shared/collab/scripts"
+AGENT="docs-2"
+LOG_FILE="/mnt/shared/collab/logs/docs-2-watcher.log"
+
+# Allowed scripts (guardrails)
+ALLOWED_SCRIPTS=(
+    "$HOME/markdown-to-notion.py"
+    "$HOME/notion-to-markdown.py"
+    "$HOME/read-notion-page.py"
+    "$HOME/bulk-upload-to-notion.sh"
+)
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "${msg}" >&2
+    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+log_info() { log "${CYAN}INFO${NC}: $1"; }
+log_ok() { log "${GREEN}OK${NC}: $1"; }
+log_warn() { log "${YELLOW}WARN${NC}: $1"; }
+log_err() { log "${RED}ERROR${NC}: $1"; }
+
+mkdir -p "${PRESENCE_DIR}" "$(dirname "${LOG_FILE}")" 2>/dev/null || true
+
+update_presence() {
+    cat > "${PRESENCE_DIR}/${AGENT}.json" << EOF
+{
+  "agent_id": "${AGENT}",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+  "state": "AWAKE",
+  "substate": "${1:-IDLE}",
+  "watcher_pid": $$,
+  "channel": "${CHANNEL}"
+}
+EOF
+}
+
+is_for_us() {
+    local file="$1"
+    local to=$(jq -r '.to // "all"' "$file" 2>/dev/null)
+    local text=$(jq -r '.content.text // ""' "$file" 2>/dev/null)
+
+    [[ "$to" == "$AGENT" ]] || [[ "$to" == "docs-2" ]] && return 0
+    echo "$text" | grep -q "@${AGENT}" && return 0
+    echo "$text" | grep -q "@docs-2" && return 0
+    echo "$text" | grep -qi "^${AGENT}" && return 0
+    echo "$text" | grep -qi "^docs-2" && return 0
+    return 1
+}
+
+is_from_us() {
+    local from=$(jq -r '.from // ""' "$1" 2>/dev/null)
+    [[ "$from" == "$AGENT" ]] || [[ "$from" == "docs-2" ]]
+}
+
+get_context() {
+    local context=""
+    for f in $(ls -t "${CHANNEL_DIR}"/msg-*.json 2>/dev/null | head -5 | tac); do
+        local from=$(jq -r '.from' "$f")
+        local text=$(jq -r '.content.text // ""' "$f")
+        context="${context}[${from}]: ${text}\n\n"
+    done
+    echo -e "$context"
+}
+
+# Check if script is allowed
+is_script_allowed() {
+    local script="$1"
+    # Expand ~ to home directory
+    script="${script/#\~/$HOME}"
+
+    for allowed in "${ALLOWED_SCRIPTS[@]}"; do
+        allowed="${allowed/#\~/$HOME}"
+        if [[ "$script" == "$allowed" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Execute a script with arguments
+execute_script() {
+    local cmd="$1"
+    log_info "Executing: $cmd"
+
+    # Extract script path (first word)
+    local script=$(echo "$cmd" | awk '{print $1}')
+    script="${script/#\~/$HOME}"
+
+    if ! is_script_allowed "$script"; then
+        log_err "Script not allowed: $script"
+        echo "ERROR: Script not in allowed list. Allowed: ${ALLOWED_SCRIPTS[*]}"
+        return 1
+    fi
+
+    # Execute with timeout
+    local output
+    if output=$(timeout 120 bash -c "$cmd" 2>&1); then
+        log_ok "Script executed successfully"
+        echo "$output"
+    else
+        local exit_code=$?
+        log_err "Script failed with exit code $exit_code"
+        echo "ERROR: Script failed (exit code $exit_code): $output"
+        return $exit_code
+    fi
+}
+
+# Invoke Gemini with documentation prompt
+invoke_docs_worker() {
+    local message_file="$1"
+    local from=$(jq -r '.from' "$message_file")
+    local text=$(jq -r '.content.text // ""' "$message_file")
+    local context=$(get_context)
+
+    local prompt="You are docs-2, a documentation worker agent using Gemini Flash.
+
+ROLE: Execute documentation tasks delegated by docs-1 (manager) or other agents.
+
+CAPABILITIES:
+- Draft documentation content
+- Upload files to Notion
+- Download from Notion
+- Bulk operations
+
+AVAILABLE SCRIPTS (you can request these):
+- ~/markdown-to-notion.py FILE PAGE_ID [--update] - Upload markdown to Notion
+- ~/notion-to-markdown.py PAGE_ID FILE - Download Notion page to markdown
+- ~/read-notion-page.py PAGE_ID - Read Notion page content
+
+GUARDRAILS:
+- Only execute allowed documentation scripts
+- Only modify files in /mnt/shared/collab/docs/ or ~/agent-collab/docs/
+- Report results back to requester
+
+OUTPUT FORMAT:
+If you need to execute a script, output EXACTLY:
+EXECUTE: <full command>
+
+For example:
+EXECUTE: ~/markdown-to-notion.py /mnt/shared/collab/docs/OVERVIEW.md 2e5c95e7d72e805ba6fdca9568fd232b
+
+If no script needed, just respond with text.
+
+CONTEXT:
+${context}
+
+REQUEST FROM ${from}:
+${text}
+
+Respond appropriately. If this is an upload request, determine the correct command and output EXECUTE: line."
+
+    log_info "Invoking Gemini for docs request from ${from}..."
+
+    local response
+    response=$("${SCRIPTS_DIR}/gemini-exec" "$prompt" 2>&1) || {
+        log_err "Gemini invocation failed"
+        echo "Failed to process request"
+        return 1
+    }
+
+    # Check if response contains EXECUTE: command
+    if echo "$response" | grep -q "^EXECUTE:"; then
+        local cmd=$(echo "$response" | grep "^EXECUTE:" | head -1 | sed 's/^EXECUTE: *//')
+        log_info "Model requested execution: $cmd"
+
+        local exec_result
+        exec_result=$(execute_script "$cmd")
+        local exec_status=$?
+
+        if [[ $exec_status -eq 0 ]]; then
+            echo "Executed: $cmd
+
+Result:
+$exec_result"
+        else
+            echo "Failed to execute: $cmd
+
+Error:
+$exec_result"
+        fi
+    else
+        # Regular text response
+        echo "$response" | head -30
+    fi
+}
+
+post_response() {
+    local response_text="$1"
+    local in_reply_to="$2"
+
+    # Escape for JSON
+    local escaped_text=$(echo "$response_text" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+
+    python3 << EOF
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import secrets
+
+now = datetime.now(timezone.utc)
+msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-docs2-{secrets.token_hex(2)}"
+
+msg = {
+    "id": msg_id,
+    "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    "session_id": "${CHANNEL}",
+    "from": "docs-2",
+    "to": "all",
+    "type": "docs",
+    "content": {
+        "text": ${escaped_text},
+        "code": None,
+        "artifacts": []
+    },
+    "metadata": {
+        "mode": "watcher",
+        "model": "gemini-2.5-flash",
+        "role": "documentation_worker",
+        "in_reply_to": "${in_reply_to}"
+    }
+}
+
+path = Path("${CHANNEL_DIR}") / f"{msg_id}.json"
+path.write_text(json.dumps(msg, indent=2) + "\n")
+print(f"Posted: {msg_id}")
+EOF
+}
+
+main() {
+    log_info "Starting docs-2 (documentation worker) watcher"
+    log_info "Channel: ${CHANNEL}"
+    log_info "Model: Gemini Flash (Tier 1)"
+    log_info "Reports to: docs-1"
+    log_info "Allowed scripts: ${ALLOWED_SCRIPTS[*]}"
+
+    command -v inotifywait &>/dev/null || { log_err "inotifywait not found"; exit 1; }
+    command -v jq &>/dev/null || { log_err "jq not found"; exit 1; }
+
+    update_presence "IDLE"
+    log_ok "Presence updated"
+
+    declare -A processed
+    for f in "${CHANNEL_DIR}"/msg-*.json; do
+        [[ -f "$f" ]] && processed["$(basename "$f")"]=1
+    done
+    log_info "Marked ${#processed[@]} existing messages as read"
+
+    inotifywait -m -e create -e moved_to "${CHANNEL_DIR}" --format '%f' 2>/dev/null | while read -r filename; do
+        [[ "$filename" != msg-*.json ]] && continue
+        [[ -n "${processed[$filename]}" ]] && continue
+        processed["$filename"]=1
+
+        local filepath="${CHANNEL_DIR}/${filename}"
+        sleep 0.5
+
+        is_from_us "$filepath" && { log_info "Skipping own message"; continue; }
+        is_for_us "$filepath" || { log_info "Message not for us: ${filename}"; continue; }
+
+        log_info "New docs request: ${filename}"
+        update_presence "WORKING"
+
+        local msg_id=$(jq -r '.id' "$filepath")
+        local response
+        if response=$(invoke_docs_worker "$filepath"); then
+            [[ -n "$response" ]] && post_response "$response" "$msg_id"
+            log_ok "Response posted"
+        else
+            log_err "Request processing failed"
+        fi
+
+        update_presence "IDLE"
+    done
+}
+
+trap 'log_info "Shutting down..."; update_presence "OFFLINE"; exit 0' SIGINT SIGTERM
+main "$@"

@@ -1,0 +1,39 @@
+{
+  "id": "docs-2",
+  "model": "gemini-2.5-flash",
+  "provider": "google",
+  "capabilities": [
+    "documentation-drafting",
+    "notion-upload",
+    "bulk-operations",
+    "file-operations"
+  ],
+  "role": "worker",
+  "status": "active",
+  "registered": "2026-01-11T17:00:00Z",
+  "cost_tier": 1,
+  "reports_to": "docs-1",
+  "scripts": {
+    "notion_upload": "~/markdown-to-notion.py",
+    "notion_download": "~/notion-to-markdown.py",
+    "notion_read": "~/read-notion-page.py"
+  },
+  "guardrails": {
+    "allowed_scripts": [
+      "~/markdown-to-notion.py",
+      "~/notion-to-markdown.py",
+      "~/read-notion-page.py",
+      "~/bulk-upload-to-notion.sh"
+    ],
+    "allowed_directories": [
+      "/mnt/shared/collab/docs/",
+      "~/agent-collab/docs/"
+    ],
+    "cannot": [
+      "delete_notion_pages",
+      "modify_non_doc_files",
+      "execute_arbitrary_scripts"
+    ]
+  },
+  "notes": "Documentation worker. Executes uploads, drafts content, handles bulk operations. Reports to docs-1 (manager)."
+}

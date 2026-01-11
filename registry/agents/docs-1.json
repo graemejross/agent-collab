@@ -1,0 +1,29 @@
+{
+  "id": "docs-1",
+  "model": "claude-3-5-haiku-20241022",
+  "provider": "anthropic",
+  "capabilities": [
+    "documentation-management",
+    "quality-review",
+    "coordination",
+    "notion-sync-approval",
+    "staleness-detection"
+  ],
+  "role": "manager",
+  "status": "active",
+  "registered": "2026-01-11T15:40:00Z",
+  "cost_tier": 2,
+  "manages": ["docs-2"],
+  "guardrails": {
+    "docs_only": true,
+    "watched_paths": [
+      "/mnt/shared/collab/CURRENT-STATE.md",
+      "/mnt/shared/collab/docs/*.md",
+      "~/agent-collab/docs/*.md"
+    ],
+    "delegate_execution_to": "docs-2",
+    "review_before_publish": true,
+    "cannot": ["modify_code", "execute_scripts", "delete_without_confirm"]
+  },
+  "notes": "Documentation Manager. Reviews quality, coordinates docs-2 for execution, approves before publish. Delegates uploads to docs-2."
+}
