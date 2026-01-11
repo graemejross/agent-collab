@@ -331,8 +331,8 @@ def interactive_mode() -> None:
 
             if response:
                 format_message(response)
-                # Show team activity after supervisor response
-                show_team_activity(response.get('timestamp'))
+                # Show recent team activity
+                show_team_activity()
             else:
                 if RICH_AVAILABLE:
                     console.print("[dim]No response received (timeout)[/dim]")
@@ -367,8 +367,8 @@ def single_command(cmd: str) -> None:
 
     if response:
         format_message(response)
-        # Show team activity after supervisor response
-        show_team_activity(response.get('timestamp'))
+        # Show recent team activity
+        show_team_activity()
     else:
         print("No response received")
 
