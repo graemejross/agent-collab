@@ -153,14 +153,16 @@ def get_recent_messages(n: int = 20) -> list:
 
     return messages
 
-def wait_for_response(after_id: str, timeout: int = 60) -> dict:
+def wait_for_response(after_id: str, timeout: int = 60, seen: set = None) -> dict:
     """Wait for a supervisor response after our message."""
     start = time.time()
-    seen = set()
-
-    # Mark existing messages as seen
-    for f in CHANNEL_DIR.glob("msg-*.json"):
-        seen.add(f.name)
+    if seen is None:
+        seen = set()
+        # Mark existing messages as seen (fallback if not provided)
+        for f in CHANNEL_DIR.glob("msg-*.json"):
+            seen.add(f.name)
+    else:
+        seen = set(seen)  # Make a copy to avoid modifying caller's set
 
     while time.time() - start < timeout:
         for f in CHANNEL_DIR.glob("msg-*.json"):
@@ -325,6 +327,9 @@ def interactive_mode() -> None:
                     print("  No recent activity")
                 continue
 
+            # Capture existing messages BEFORE sending (to avoid race condition)
+            seen_before_send = set(f.name for f in CHANNEL_DIR.glob("msg-*.json"))
+
             # Send message to supervisor
             if RICH_AVAILABLE:
                 with console.status("[cyan]Sending to supervisor...[/cyan]"):
@@ -336,10 +341,10 @@ def interactive_mode() -> None:
             # Wait for response
             if RICH_AVAILABLE:
                 with console.status("[cyan]Waiting for supervisor...[/cyan]"):
-                    response = wait_for_response("", timeout=60)
+                    response = wait_for_response("", timeout=60, seen=seen_before_send)
             else:
                 print("Waiting for response...")
-                response = wait_for_response("", timeout=60)
+                response = wait_for_response("", timeout=60, seen=seen_before_send)
 
             if response:
                 format_message(response)
@@ -368,14 +373,17 @@ def single_command(cmd: str) -> None:
     else:
         print(f"Sending: {cmd}")
 
+    # Capture existing messages BEFORE sending (to avoid race condition)
+    seen_before_send = set(f.name for f in CHANNEL_DIR.glob("msg-*.json"))
+
     send_message(cmd)
 
     if RICH_AVAILABLE:
         with console.status("[cyan]Waiting for supervisor...[/cyan]"):
-            response = wait_for_response("", timeout=60)
+            response = wait_for_response("", timeout=60, seen=seen_before_send)
     else:
         print("Waiting...")
-        response = wait_for_response("", timeout=60)
+        response = wait_for_response("", timeout=60, seen=seen_before_send)
 
     if response:
         format_message(response)
