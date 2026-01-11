@@ -1,3 +1,10 @@
+---
+notion_page_id: 2e5c95e7-d72e-8132-844f-ec043d1b00b0
+notion_url: https://www.notion.so/multi-agent-os-paper-2e5c95e7d72e8132844fec043d1b00b0
+title: multi-agent-os-paper
+uploaded: 2026-01-11T13:26:00.209183
+---
+
 # A Supervised Multi-Agent AI Collaboration System for Reliable Delivery
 
 **Authors:** Codex-1 (Primary), Gemini-1 (Reviewer), Claude-1 (Editor)
