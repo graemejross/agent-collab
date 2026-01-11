@@ -1,0 +1,397 @@
+#!/bin/bash
+#
+# supervisor-watcher - Orchestration Supervisor agent watcher
+#
+# Uses Claude Sonnet for task orchestration:
+# - Receives directives from human via human-supervisor channel
+# - Decomposes complex tasks into subtasks
+# - Assigns work to appropriate agents
+# - Monitors progress and reports status
+# - Escalates issues to human
+#
+# Usage:
+#   supervisor-watcher
+#
+# Run in tmux:
+#   tmux new-session -d -s supervisor '/mnt/shared/collab/scripts/supervisor-watcher'
+#
+
+set -e
+
+COLLAB_DIR="/mnt/shared/collab"
+CHANNEL_DIR="${COLLAB_DIR}/channels/human-supervisor"
+TEAM_CHANNEL="${COLLAB_DIR}/channels/agent-os-paper"
+PRESENCE_DIR="${COLLAB_DIR}/presence"
+REGISTRY_DIR="${COLLAB_DIR}/registry/agents"
+SCRIPTS_DIR="${COLLAB_DIR}/scripts"
+AGENT="supervisor"
+LOG_FILE="${COLLAB_DIR}/logs/supervisor-watcher.log"
+
+# Colors for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "${msg}" >&2
+    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+log_info() { log "${CYAN}INFO${NC}: $1"; }
+log_ok() { log "${GREEN}OK${NC}: $1"; }
+log_warn() { log "${YELLOW}WARN${NC}: $1"; }
+log_err() { log "${RED}ERROR${NC}: $1"; }
+log_cmd() { log "${MAGENTA}CMD${NC}: $1"; }
+
+# Ensure directories exist
+mkdir -p "${CHANNEL_DIR}" "${PRESENCE_DIR}" "$(dirname "${LOG_FILE}")" 2>/dev/null || true
+
+# Update presence file
+update_presence() {
+    local state="${1:-IDLE}"
+    cat > "${PRESENCE_DIR}/${AGENT}.json" << EOF
+{
+  "agent_id": "${AGENT}",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+  "state": "AWAKE",
+  "substate": "${state}",
+  "watcher_pid": $$,
+  "channel": "human-supervisor"
+}
+EOF
+}
+
+# Check if message is from human (not from self)
+is_from_human() {
+    local file="$1"
+    local from=$(jq -r '.from // ""' "$file" 2>/dev/null)
+    [[ "$from" == "human" ]] || [[ "$from" == "graeme" ]]
+}
+
+# Check if message is from us
+is_from_us() {
+    local file="$1"
+    local from=$(jq -r '.from // ""' "$file" 2>/dev/null)
+    [[ "$from" == "$AGENT" ]] || [[ "$from" == "supervisor" ]]
+}
+
+# Get agent registry info
+get_agent_registry() {
+    local registry=""
+    for f in "${REGISTRY_DIR}"/*.json; do
+        if [[ -f "$f" ]]; then
+            local id=$(jq -r '.id' "$f" 2>/dev/null)
+            local model=$(jq -r '.model' "$f" 2>/dev/null)
+            local role=$(jq -r '.role' "$f" 2>/dev/null)
+            local caps=$(jq -r '.capabilities | join(", ")' "$f" 2>/dev/null)
+            registry="${registry}- ${id} (${model}, ${role}): ${caps}\n"
+        fi
+    done
+    echo -e "$registry"
+}
+
+# Get agent presence status
+get_agent_status() {
+    local status=""
+    for f in "${PRESENCE_DIR}"/*.json; do
+        if [[ -f "$f" ]]; then
+            local id=$(jq -r '.agent_id' "$f" 2>/dev/null)
+            local state=$(jq -r '.state' "$f" 2>/dev/null)
+            local substate=$(jq -r '.substate' "$f" 2>/dev/null)
+            local ts=$(jq -r '.timestamp' "$f" 2>/dev/null)
+            status="${status}- ${id}: ${state}/${substate} (last seen: ${ts})\n"
+        fi
+    done
+    echo -e "$status"
+}
+
+# Get recent team channel activity
+get_team_activity() {
+    local n="${1:-10}"
+    local activity=""
+
+    for f in $(ls -t "${TEAM_CHANNEL}"/msg-*.json 2>/dev/null | head -n "$n" | tac); do
+        local from=$(jq -r '.from' "$f" 2>/dev/null)
+        local text=$(jq -r '.content.text // ""' "$f" 2>/dev/null | head -c 200)
+        local ts=$(jq -r '.timestamp' "$f" 2>/dev/null)
+        activity="${activity}[${ts}] ${from}: ${text}...\n\n"
+    done
+
+    echo -e "$activity"
+}
+
+# Get recent human-supervisor context
+get_context() {
+    local n="${1:-5}"
+    local context=""
+
+    for f in $(ls -t "${CHANNEL_DIR}"/msg-*.json 2>/dev/null | head -n "$n" | tac); do
+        local from=$(jq -r '.from' "$f" 2>/dev/null)
+        local text=$(jq -r '.content.text // ""' "$f" 2>/dev/null)
+        context="${context}[${from}]: ${text}\n\n"
+    done
+
+    echo -e "$context"
+}
+
+# Invoke Claude Sonnet for supervisor reasoning
+invoke_supervisor() {
+    local message_file="$1"
+    local text=$(jq -r '.content.text // ""' "$message_file")
+    local context=$(get_context 10)
+    local agent_registry=$(get_agent_registry)
+    local agent_status=$(get_agent_status)
+    local team_activity=$(get_team_activity 5)
+
+    # Supervisor system prompt
+    local prompt="You are the Supervisor agent in a multi-agent AI collaboration system.
+
+YOUR ROLE:
+You orchestrate work between the human (boss) and worker agents. You NEVER implement tasks yourself - you decompose, assign, track, and report.
+
+YOUR CAPABILITIES:
+- Decompose complex tasks into subtasks
+- Assign work to appropriate agents based on their capabilities
+- Monitor progress across team channels
+- Report status to human
+- Escalate blockers and issues
+- Coordinate between agents
+
+YOUR GUARDRAILS:
+- NEVER implement code or make changes directly
+- NEVER override human decisions
+- ALWAYS assign implementation to worker agents
+- ALWAYS escalate P1 incidents and security issues to human
+- ALWAYS provide clear task definitions with acceptance criteria
+
+COMMAND FORMATS YOU UNDERSTAND:
+- 'status' - Report current agent status and recent activity
+- 'assign <agent> <task>' - Assign a task to specific agent
+- 'broadcast <message>' - Send message to all agents
+- Natural language directives - You interpret and act appropriately
+
+=== AVAILABLE AGENTS ===
+${agent_registry}
+
+=== CURRENT AGENT STATUS ===
+${agent_status}
+
+=== RECENT TEAM ACTIVITY (read-only observation) ===
+${team_activity}
+
+=== RECENT HUMAN-SUPERVISOR CONVERSATION ===
+${context}
+
+=== NEW DIRECTIVE FROM HUMAN ===
+${text}
+
+Respond as the supervisor. Be concise and action-oriented.
+
+If this is a STATUS request:
+- Summarize agent availability
+- Note any recent issues or blockers
+- Highlight tasks in progress
+
+If this is a TASK directive:
+1. Acknowledge the task
+2. Decompose into subtasks if complex
+3. Identify which agent(s) should handle each part
+4. State what you will do next (e.g., 'I will message claude-1 to...')
+
+If you need to assign work, format your response with:
+ASSIGN TO: <agent-id>
+TASK: <clear task description>
+ACCEPTANCE CRITERIA: <what 'done' looks like>
+
+Always end with your next action or what you're waiting for."
+
+    log_info "Invoking supervisor reasoning..."
+
+    local response
+    response=$("${SCRIPTS_DIR}/sonnet-exec" "$prompt" 2>&1) || {
+        log_err "Supervisor invocation failed: $response"
+        return 1
+    }
+
+    echo "$response"
+}
+
+# Post response to human-supervisor channel
+post_response() {
+    local response_text="$1"
+    local in_reply_to="$2"
+
+    python3 << EOF
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import secrets
+
+now = datetime.now(timezone.utc)
+msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-supervisor-{secrets.token_hex(2)}"
+
+msg = {
+    "id": msg_id,
+    "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    "session_id": "human-supervisor",
+    "from": "supervisor",
+    "to": "human",
+    "type": "supervisor",
+    "content": {
+        "text": """${response_text}""",
+        "code": None,
+        "artifacts": []
+    },
+    "metadata": {
+        "mode": "watcher",
+        "model": "claude-sonnet-4-20250514",
+        "role": "supervisor",
+        "in_reply_to": "${in_reply_to}"
+    }
+}
+
+path = Path("${CHANNEL_DIR}") / f"{msg_id}.json"
+path.write_text(json.dumps(msg, indent=2) + "\n")
+print(f"Posted: {msg_id}")
+EOF
+}
+
+# Post directive to team channel
+post_directive() {
+    local target_agent="$1"
+    local directive_text="$2"
+
+    python3 << EOF
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import secrets
+
+now = datetime.now(timezone.utc)
+msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-supervisor-{secrets.token_hex(2)}"
+
+msg = {
+    "id": msg_id,
+    "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    "session_id": "agent-os-paper",
+    "from": "supervisor",
+    "to": "${target_agent}",
+    "type": "directive",
+    "content": {
+        "text": """${directive_text}""",
+        "code": None,
+        "artifacts": []
+    },
+    "metadata": {
+        "mode": "watcher",
+        "model": "claude-sonnet-4-20250514",
+        "role": "supervisor"
+    }
+}
+
+path = Path("${TEAM_CHANNEL}") / f"{msg_id}.json"
+path.write_text(json.dumps(msg, indent=2) + "\n")
+print(f"Directive posted: {msg_id}")
+EOF
+}
+
+# Main watch loop
+main() {
+    log_info "Starting Supervisor watcher"
+    log_info "Agent: ${AGENT} (Orchestration Supervisor)"
+    log_info "Primary channel: ${CHANNEL_DIR}"
+    log_info "Monitoring: ${TEAM_CHANNEL}"
+
+    # Check dependencies
+    if ! command -v inotifywait &> /dev/null; then
+        log_err "inotifywait not found. Install with: apt install inotify-tools"
+        exit 1
+    fi
+
+    if [[ ! -x "${SCRIPTS_DIR}/sonnet-exec" ]]; then
+        log_err "sonnet-exec not found or not executable"
+        exit 1
+    fi
+
+    # Initial presence
+    update_presence "IDLE"
+    log_ok "Presence updated: AWAKE/IDLE"
+
+    # Track processed files
+    declare -A processed
+
+    # Mark existing files as processed
+    for f in "${CHANNEL_DIR}"/msg-*.json; do
+        [[ -f "$f" ]] && processed["$(basename "$f")"]=1
+    done
+    log_info "Marked ${#processed[@]} existing messages as read"
+
+    # Watch for new files in human-supervisor channel
+    inotifywait -m -e create -e moved_to "${CHANNEL_DIR}" --format '%f' 2>/dev/null | while read -r filename; do
+        [[ "$filename" != msg-*.json ]] && continue
+        [[ -n "${processed[$filename]}" ]] && continue
+        processed["$filename"]=1
+
+        local filepath="${CHANNEL_DIR}/${filename}"
+        sleep 0.5
+
+        if is_from_us "$filepath"; then
+            log_info "Skipping own message: ${filename}"
+            continue
+        fi
+
+        if ! is_from_human "$filepath"; then
+            log_info "Message not from human: ${filename}"
+            continue
+        fi
+
+        log_cmd "New directive from human: ${filename}"
+        update_presence "PROCESSING"
+
+        local msg_id=$(jq -r '.id' "$filepath" 2>/dev/null)
+        local text=$(jq -r '.content.text // ""' "$filepath" 2>/dev/null)
+        log_info "Directive: ${text:0:80}..."
+
+        local response
+        if response=$(invoke_supervisor "$filepath"); then
+            if [[ -n "$response" ]]; then
+                log_ok "Supervisor response ready"
+                post_response "$response" "$msg_id"
+
+                # Check if response contains an assignment directive
+                if echo "$response" | grep -q "ASSIGN TO:"; then
+                    local target=$(echo "$response" | grep "ASSIGN TO:" | head -1 | sed 's/ASSIGN TO: *//')
+                    if [[ -n "$target" ]]; then
+                        log_info "Detected assignment to: ${target}"
+                        # Extract task portion for directive
+                        local task_text=$(echo "$response" | grep -A 100 "TASK:" | head -20)
+                        if [[ -n "$task_text" ]]; then
+                            post_directive "$target" "From supervisor: $task_text"
+                            log_ok "Directive posted to ${target}"
+                        fi
+                    fi
+                fi
+            else
+                log_warn "Empty response from supervisor"
+            fi
+        else
+            log_err "Supervisor processing failed"
+        fi
+
+        update_presence "IDLE"
+    done
+}
+
+cleanup() {
+    log_info "Shutting down Supervisor watcher..."
+    update_presence "OFFLINE"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+main "$@"

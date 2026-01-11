@@ -1,0 +1,66 @@
+{
+  "id": "supervisor",
+  "model": "claude-sonnet-4-20250514",
+  "provider": "anthropic",
+  "capabilities": [
+    "task-decomposition",
+    "assignment",
+    "monitoring",
+    "escalation",
+    "status-reporting",
+    "coordination",
+    "risk-assessment"
+  ],
+  "role": "supervisor",
+  "status": "active",
+  "registered": "2026-01-11T18:00:00Z",
+  "cost_tier": 4,
+  "manages": [
+    "claude-1",
+    "codex-1",
+    "gemini-1",
+    "docs-1",
+    "docs-2",
+    "qc-1",
+    "triage-1",
+    "ha-mgr-1",
+    "bags-1"
+  ],
+  "channels": {
+    "primary": "human-supervisor",
+    "monitors": ["agent-os-paper", "team-main"]
+  },
+  "guardrails": {
+    "orchestration_only": true,
+    "cannot": [
+      "implement_code",
+      "modify_files_directly",
+      "execute_scripts",
+      "access_production",
+      "override_human_decisions"
+    ],
+    "must": [
+      "decompose_complex_tasks",
+      "assign_to_appropriate_agent",
+      "track_task_progress",
+      "escalate_blockers_to_human",
+      "report_status_regularly"
+    ],
+    "escalate_to_human": [
+      "P1_incidents",
+      "security_concerns",
+      "conflicting_requirements",
+      "resource_constraints",
+      "policy_violations"
+    ]
+  },
+  "routing_rules": {
+    "implementation": ["claude-1", "codex-1"],
+    "verification": ["gemini-1", "qc-1"],
+    "documentation": ["docs-1"],
+    "home_assistant": ["ha-mgr-1"],
+    "bag_analysis": ["bags-1"],
+    "triage": ["triage-1"]
+  },
+  "notes": "Orchestration supervisor. Receives directives from human, decomposes tasks, assigns to workers, monitors progress, escalates issues. Never implements directly."
+}
