@@ -1,3 +1,10 @@
+---
+notion_page_id: 2e5c95e7-d72e-8160-9f6b-d4ace4abae4e
+notion_url: https://www.notion.so/agent-role-specs-2e5c95e7d72e81609f6bd4ace4abae4e
+title: agent-role-specs
+uploaded: 2026-01-11T15:36:59.040802
+---
+
 # Agent Role Specifications
 
 **Version:** 2.0
@@ -8,17 +15,17 @@
 
 ## Table of Contents
 
-1. [Architecture Overview](#architecture-overview)
-2. [Approval Workflow](#approval-workflow)
-3. [Evidence Bundle Schema](#evidence-bundle-schema)
-4. [Agent Specifications](#agent-specifications)
-   - [qc-1: Quality Control](#1-quality-control-agent-qc-1)
-   - [docs-1: Documentation Steward](#2-documentation-steward-docs-1)
-   - [triage-1: Incident Triage](#3-incident-triage-agent-triage-1)
-   - [ha-mgr-1: HA Integrations Manager](#4-home-assistant-integrations-manager-ha-mgr-1)
-   - [bags-1: Bag Analysis Specialist](#5-bag-analysis-specialist-bags-1)
-5. [Additional Roles](#additional-roles)
-6. [Implementation Priority](#implementation-priority)
+1. [Architecture Overview]
+2. [Approval Workflow]
+3. [Evidence Bundle Schema]
+4. [Agent Specifications]
+   - [qc-1: Quality Control]
+   - [docs-1: Documentation Steward]
+   - [triage-1: Incident Triage]
+   - [ha-mgr-1: HA Integrations Manager]
+   - [bags-1: Bag Analysis Specialist]
+5. [Additional Roles]
+6. [Implementation Priority]
 
 ---
 
