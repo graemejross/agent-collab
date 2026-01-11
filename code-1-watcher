@@ -1,0 +1,253 @@
+#!/bin/bash
+#
+# code-1-watcher - Code Manager agent watcher
+#
+# Uses Claude Sonnet to review code proposals before code-2 writes them.
+# Checks for security issues, correct paths, and code quality.
+#
+# Usage:
+#   code-1-watcher <channel>
+#
+# Run in tmux:
+#   tmux new-session -d -s code-1-watcher '/mnt/shared/collab/scripts/code-1-watcher agent-os-paper'
+#
+
+set -e
+
+CHANNEL="${1:-agent-os-paper}"
+CHANNEL_DIR="/mnt/shared/collab/channels/${CHANNEL}"
+PRESENCE_DIR="/mnt/shared/collab/presence"
+SCRIPTS_DIR="/mnt/shared/collab/scripts"
+AGENT="code-1"
+LOG_FILE="/mnt/shared/collab/logs/code-1-watcher.log"
+
+# Guardrails reference (same as code-2)
+ALLOWED_PATHS=(
+    "/mnt/shared/collab/scripts/"
+    "/mnt/shared/collab/workspace/"
+    "/home/graeme/agent-collab/"
+)
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "${msg}" >&2
+    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+log_info() { log "${BLUE}INFO${NC}: $1"; }
+log_ok() { log "${GREEN}OK${NC}: $1"; }
+log_warn() { log "${YELLOW}WARN${NC}: $1"; }
+log_err() { log "${RED}ERROR${NC}: $1"; }
+
+mkdir -p "${PRESENCE_DIR}" "$(dirname "${LOG_FILE}")" 2>/dev/null || true
+
+update_presence() {
+    local state="${1:-IDLE}"
+    cat > "${PRESENCE_DIR}/${AGENT}.json" << EOF
+{
+  "agent_id": "${AGENT}",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+  "state": "AWAKE",
+  "substate": "${state}",
+  "watcher_pid": $$,
+  "channel": "${CHANNEL}"
+}
+EOF
+}
+
+is_for_us() {
+    local file="$1"
+    local to=$(jq -r '.to // "all"' "$file" 2>/dev/null)
+    local text=$(jq -r '.content.text // ""' "$file" 2>/dev/null)
+
+    [[ "$to" == "$AGENT" ]] || [[ "$to" == "code-1" ]] || \
+    [[ "$text" =~ ^code-1[[:space:]] ]] || [[ "$text" =~ @code-1 ]]
+}
+
+is_from_us() {
+    local file="$1"
+    local from=$(jq -r '.from // ""' "$file" 2>/dev/null)
+    [[ "$from" == "$AGENT" ]] || [[ "$from" == "code-1" ]]
+}
+
+# Invoke Claude Sonnet to review code
+invoke_code_reviewer() {
+    local message_file="$1"
+    local from=$(jq -r '.from' "$message_file")
+    local text=$(jq -r '.content.text // ""' "$message_file")
+
+    local prompt="You are code-1, the Code Manager agent responsible for reviewing code before it gets written.
+
+YOUR ROLE:
+- Review code proposals for security, quality, and correctness
+- Verify target paths are in allowed list
+- Check for hardcoded secrets or credentials
+- Approve good code, reject problematic code
+- Direct code-2 to write approved code
+
+ALLOWED PATHS:
+${ALLOWED_PATHS[*]}
+
+REVIEW CHECKLIST:
+1. No hardcoded secrets, API keys, or passwords
+2. Target path is in allowed list
+3. Code does what it claims to do
+4. No obvious security vulnerabilities (command injection, path traversal, etc.)
+5. Code is reasonably well-structured
+
+REQUEST FROM ${from}:
+${text}
+
+If this is a code proposal, review it and respond with ONE of:
+
+APPROVED - If the code passes all checks:
+\`\`\`
+APPROVED: [brief reason]
+code-2 WRITE FILE: /path/to/file.ext
+\\\`\\\`\\\`
+[the approved code]
+\\\`\\\`\\\`
+\`\`\`
+
+REJECTED - If the code has issues:
+\`\`\`
+REJECTED: [specific issues found]
+- Issue 1
+- Issue 2
+Suggested fixes: [how to fix]
+\`\`\`
+
+If this is not a code proposal, respond helpfully about code-related questions."
+
+    log_info "Invoking code review for message from ${from}..."
+
+    local response
+    response=$("${SCRIPTS_DIR}/sonnet-exec" "$prompt" 2>&1) || {
+        log_err "Sonnet invocation failed"
+        return 1
+    }
+
+    echo "$response"
+}
+
+post_response() {
+    local response_text="$1"
+    local in_reply_to="$2"
+
+    python3 << EOF
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import secrets
+
+now = datetime.now(timezone.utc)
+msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-code1-{secrets.token_hex(2)}"
+
+msg = {
+    "id": msg_id,
+    "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    "session_id": "${CHANNEL}",
+    "from": "code-1",
+    "to": "all",
+    "type": "code-review",
+    "content": {
+        "text": """${response_text}""",
+        "code": None,
+        "artifacts": []
+    },
+    "metadata": {
+        "mode": "watcher",
+        "model": "claude-sonnet-4-20250514",
+        "role": "code_manager",
+        "in_reply_to": "${in_reply_to}"
+    }
+}
+
+path = Path("${CHANNEL_DIR}") / f"{msg_id}.json"
+path.write_text(json.dumps(msg, indent=2) + "\n")
+print(f"Posted: {msg_id}")
+EOF
+}
+
+main() {
+    log_info "Starting code-1 (Code Manager) watcher"
+    log_info "Channel: ${CHANNEL}"
+    log_info "Model: Claude Sonnet (Tier 4)"
+    log_info "Manages: code-2"
+
+    if ! command -v inotifywait &> /dev/null; then
+        log_err "inotifywait not found"
+        exit 1
+    fi
+
+    if [[ ! -x "${SCRIPTS_DIR}/sonnet-exec" ]]; then
+        log_err "sonnet-exec not found"
+        exit 1
+    fi
+
+    update_presence "IDLE"
+    log_ok "Presence updated"
+
+    declare -A processed
+    for f in "${CHANNEL_DIR}"/msg-*.json; do
+        [[ -f "$f" ]] && processed["$(basename "$f")"]=1
+    done
+    log_info "Marked ${#processed[@]} existing messages as read"
+
+    inotifywait -m -e create -e moved_to "${CHANNEL_DIR}" --format '%f' 2>/dev/null | while read -r filename; do
+        [[ "$filename" != msg-*.json ]] && continue
+        [[ -n "${processed[$filename]}" ]] && continue
+        processed["$filename"]=1
+
+        local filepath="${CHANNEL_DIR}/${filename}"
+        sleep 0.5
+
+        if is_from_us "$filepath"; then
+            log_info "Skipping own message"
+            continue
+        fi
+
+        if ! is_for_us "$filepath"; then
+            continue
+        fi
+
+        log_info "New code review request: ${filename}"
+        update_presence "REVIEWING"
+
+        local msg_id=$(jq -r '.id' "$filepath" 2>/dev/null)
+
+        local response
+        if response=$(invoke_code_reviewer "$filepath"); then
+            if [[ -n "$response" ]]; then
+                post_response "$response" "$msg_id"
+                log_ok "Review posted"
+
+                # If approved, the response contains directive to code-2
+                if echo "$response" | grep -q "APPROVED"; then
+                    log_info "Code approved - code-2 should pick up the write directive"
+                fi
+            fi
+        else
+            log_err "Review failed"
+        fi
+
+        update_presence "IDLE"
+    done
+}
+
+cleanup() {
+    log_info "Shutting down code-1 watcher..."
+    update_presence "OFFLINE"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+main "$@"

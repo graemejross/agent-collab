@@ -1,0 +1,43 @@
+{
+  "id": "code-1",
+  "model": "claude-sonnet-4-20250514",
+  "provider": "anthropic",
+  "capabilities": [
+    "code-review",
+    "security-analysis",
+    "implementation-approval",
+    "quality-assessment",
+    "architecture-review"
+  ],
+  "role": "manager",
+  "status": "active",
+  "registered": "2026-01-11T20:20:00Z",
+  "cost_tier": 4,
+  "manages": ["code-2"],
+  "guardrails": {
+    "review_before_approve": true,
+    "check_security": true,
+    "check_guardrails": true,
+    "cannot": [
+      "write_files_directly",
+      "execute_code",
+      "bypass_review",
+      "approve_own_code"
+    ],
+    "must": [
+      "review_all_code_proposals",
+      "check_allowed_paths",
+      "verify_no_secrets",
+      "confirm_backup_for_overwrites"
+    ]
+  },
+  "review_checklist": [
+    "Code follows project conventions",
+    "No hardcoded secrets or credentials",
+    "Target path is in allowed list",
+    "Existing file backed up if overwriting",
+    "Code does what it claims to do",
+    "No obvious security vulnerabilities"
+  ],
+  "notes": "Code Manager. Reviews code proposals from workers (codex-1, claude-1), approves/rejects before code-2 writes. Never writes files directly."
+}

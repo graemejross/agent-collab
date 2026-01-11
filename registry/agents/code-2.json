@@ -1,0 +1,46 @@
+{
+  "id": "code-2",
+  "model": "gemini-2.5-flash",
+  "provider": "google",
+  "capabilities": [
+    "file-writing",
+    "code-formatting",
+    "backup-creation",
+    "syntax-validation"
+  ],
+  "role": "worker",
+  "status": "active",
+  "registered": "2026-01-11T20:20:00Z",
+  "cost_tier": 1,
+  "reports_to": "code-1",
+  "guardrails": {
+    "allowed_paths": [
+      "/mnt/shared/collab/scripts/",
+      "/mnt/shared/collab/workspace/",
+      "/home/graeme/agent-collab/"
+    ],
+    "blocked_paths": [
+      "/home/graeme/.credentials",
+      "/home/graeme/.bashrc",
+      "/home/graeme/.bash_profile",
+      "/home/graeme/CLAUDE.md",
+      "/home/graeme/.ssh/",
+      "/etc/",
+      "/root/"
+    ],
+    "allowed_extensions": [
+      ".py", ".sh", ".js", ".ts", ".json", ".yaml", ".yml", ".md", ".txt"
+    ],
+    "max_file_size_kb": 100,
+    "backup_before_overwrite": true,
+    "require_approval": true,
+    "cannot": [
+      "write_outside_allowed_paths",
+      "delete_files",
+      "execute_written_code",
+      "modify_credentials",
+      "write_binary_files"
+    ]
+  },
+  "notes": "Code Worker. Writes files to filesystem after approval from code-1 or supervisor. Strict path and content guardrails."
+}

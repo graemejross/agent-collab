@@ -1,0 +1,429 @@
+#!/bin/bash
+#
+# code-2-watcher - Code Worker agent watcher
+#
+# Uses Gemini Flash to parse code writing requests and write files.
+# Strict guardrails on allowed paths and file types.
+#
+# Message format for writing files:
+#   WRITE FILE: /path/to/file.ext
+#   ```
+#   file content here
+#   ```
+#
+# Usage:
+#   code-2-watcher <channel>
+#
+# Run in tmux:
+#   tmux new-session -d -s code-2-watcher '/mnt/shared/collab/scripts/code-2-watcher agent-os-paper'
+#
+
+set -e
+
+CHANNEL="${1:-agent-os-paper}"
+CHANNEL_DIR="/mnt/shared/collab/channels/${CHANNEL}"
+PRESENCE_DIR="/mnt/shared/collab/presence"
+SCRIPTS_DIR="/mnt/shared/collab/scripts"
+BACKUP_DIR="/mnt/shared/collab/workspace/backups"
+AGENT="code-2"
+LOG_FILE="/mnt/shared/collab/logs/code-2-watcher.log"
+
+# Guardrails
+ALLOWED_PATHS=(
+    "/mnt/shared/collab/scripts/"
+    "/mnt/shared/collab/workspace/"
+    "/home/graeme/agent-collab/"
+)
+
+BLOCKED_PATHS=(
+    "/home/graeme/.credentials"
+    "/home/graeme/.bashrc"
+    "/home/graeme/.bash_profile"
+    "/home/graeme/CLAUDE.md"
+    "/home/graeme/.ssh/"
+    "/etc/"
+    "/root/"
+)
+
+ALLOWED_EXTENSIONS=(".py" ".sh" ".js" ".ts" ".json" ".yaml" ".yml" ".md" ".txt")
+
+MAX_FILE_SIZE_KB=100
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "${msg}" >&2
+    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+log_info() { log "${BLUE}INFO${NC}: $1"; }
+log_ok() { log "${GREEN}OK${NC}: $1"; }
+log_warn() { log "${YELLOW}WARN${NC}: $1"; }
+log_err() { log "${RED}ERROR${NC}: $1"; }
+
+# Ensure directories exist
+mkdir -p "${PRESENCE_DIR}" "${BACKUP_DIR}" "$(dirname "${LOG_FILE}")" 2>/dev/null || true
+
+# Update presence
+update_presence() {
+    local state="${1:-IDLE}"
+    cat > "${PRESENCE_DIR}/${AGENT}.json" << EOF
+{
+  "agent_id": "${AGENT}",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+  "state": "AWAKE",
+  "substate": "${state}",
+  "watcher_pid": $$,
+  "channel": "${CHANNEL}"
+}
+EOF
+}
+
+# Check if message is for us
+is_for_us() {
+    local file="$1"
+    local to=$(jq -r '.to // "all"' "$file" 2>/dev/null)
+    local text=$(jq -r '.content.text // ""' "$file" 2>/dev/null)
+
+    [[ "$to" == "$AGENT" ]] || [[ "$to" == "code-2" ]] || \
+    [[ "$text" =~ ^code-2[[:space:]] ]] || [[ "$text" =~ @code-2 ]]
+}
+
+# Check if message is from us
+is_from_us() {
+    local file="$1"
+    local from=$(jq -r '.from // ""' "$file" 2>/dev/null)
+    [[ "$from" == "$AGENT" ]] || [[ "$from" == "code-2" ]]
+}
+
+# Check if path is allowed
+is_path_allowed() {
+    local filepath="$1"
+
+    # Resolve to absolute path
+    filepath=$(realpath -m "$filepath" 2>/dev/null || echo "$filepath")
+
+    # Check blocked paths first
+    for blocked in "${BLOCKED_PATHS[@]}"; do
+        if [[ "$filepath" == "$blocked"* ]]; then
+            log_err "Path is blocked: $filepath"
+            return 1
+        fi
+    done
+
+    # Check allowed paths
+    for allowed in "${ALLOWED_PATHS[@]}"; do
+        if [[ "$filepath" == "$allowed"* ]]; then
+            return 0
+        fi
+    done
+
+    log_err "Path not in allowed list: $filepath"
+    return 1
+}
+
+# Check if extension is allowed
+is_extension_allowed() {
+    local filepath="$1"
+    local ext=".${filepath##*.}"
+
+    for allowed_ext in "${ALLOWED_EXTENSIONS[@]}"; do
+        if [[ "$ext" == "$allowed_ext" ]]; then
+            return 0
+        fi
+    done
+
+    log_err "Extension not allowed: $ext"
+    return 1
+}
+
+# Create backup of existing file
+create_backup() {
+    local filepath="$1"
+    if [[ -f "$filepath" ]]; then
+        local filename=$(basename "$filepath")
+        local backup_path="${BACKUP_DIR}/${filename}.$(date +%Y%m%d-%H%M%S).bak"
+        cp "$filepath" "$backup_path"
+        log_ok "Backup created: $backup_path"
+        echo "$backup_path"
+    fi
+}
+
+# Write file with guardrails
+write_file() {
+    local filepath="$1"
+    local content="$2"
+
+    # Validate path
+    if ! is_path_allowed "$filepath"; then
+        return 1
+    fi
+
+    # Validate extension
+    if ! is_extension_allowed "$filepath"; then
+        return 1
+    fi
+
+    # Check content size
+    local size_kb=$(echo "$content" | wc -c | awk '{print int($1/1024)}')
+    if [[ $size_kb -gt $MAX_FILE_SIZE_KB ]]; then
+        log_err "Content too large: ${size_kb}KB > ${MAX_FILE_SIZE_KB}KB limit"
+        return 1
+    fi
+
+    # Create backup if file exists
+    local backup=""
+    if [[ -f "$filepath" ]]; then
+        backup=$(create_backup "$filepath")
+    fi
+
+    # Ensure directory exists
+    mkdir -p "$(dirname "$filepath")" 2>/dev/null || true
+
+    # Write file
+    echo "$content" > "$filepath"
+
+    # Make executable if shell script
+    if [[ "$filepath" == *.sh ]]; then
+        chmod +x "$filepath"
+        log_info "Made executable: $filepath"
+    fi
+
+    log_ok "File written: $filepath"
+    if [[ -n "$backup" ]]; then
+        echo "Backup at: $backup"
+    fi
+
+    return 0
+}
+
+# Parse write request from message
+parse_write_request() {
+    local text="$1"
+
+    # Look for WRITE FILE: pattern
+    if [[ "$text" =~ WRITE[[:space:]]FILE:[[:space:]]*([^[:space:]]+) ]]; then
+        local filepath="${BASH_REMATCH[1]}"
+
+        # Extract content between ``` markers
+        local content=$(echo "$text" | sed -n '/^```/,/^```$/p' | sed '1d;$d')
+
+        if [[ -n "$content" ]]; then
+            echo "PATH:$filepath"
+            echo "CONTENT:$content"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Invoke Gemini to process code request
+invoke_code_worker() {
+    local message_file="$1"
+    local from=$(jq -r '.from' "$message_file")
+    local text=$(jq -r '.content.text // ""' "$message_file")
+
+    # Check if this is a direct write request
+    if [[ "$text" =~ WRITE[[:space:]]FILE: ]]; then
+        log_info "Direct write request detected"
+
+        # Extract filepath
+        local filepath=$(echo "$text" | grep -oP 'WRITE FILE:\s*\K[^\s]+')
+
+        # Extract content (between ``` markers)
+        local content=$(echo "$text" | sed -n '/^```/,/^```$/p' | sed '1d;$d')
+
+        if [[ -z "$content" ]]; then
+            # Try python/bash/etc code block
+            content=$(echo "$text" | sed -n '/^```[a-z]*/,/^```$/p' | sed '1d;$d')
+        fi
+
+        if [[ -n "$filepath" ]] && [[ -n "$content" ]]; then
+            local result
+            if result=$(write_file "$filepath" "$content" 2>&1); then
+                echo "SUCCESS: File written to $filepath"
+                echo "$result"
+            else
+                echo "FAILED: Could not write file"
+                echo "$result"
+            fi
+            return 0
+        else
+            echo "ERROR: Could not parse file path or content from request"
+            return 1
+        fi
+    fi
+
+    # Otherwise, use Gemini to understand the request
+    local prompt="You are code-2, a Code Worker agent that writes files to the filesystem.
+
+You receive code implementation requests and write files.
+
+GUARDRAILS:
+- Only write to allowed paths: ${ALLOWED_PATHS[*]}
+- Only these extensions: ${ALLOWED_EXTENSIONS[*]}
+- Max file size: ${MAX_FILE_SIZE_KB}KB
+- Cannot write to: ~/.credentials, ~/.bashrc, ~/CLAUDE.md, ~/.ssh/, /etc/
+
+REQUEST FROM ${from}:
+${text}
+
+If this is a request to write a file, respond with EXACTLY this format:
+WRITE FILE: /full/path/to/file.ext
+\`\`\`
+file content here
+\`\`\`
+
+If the request is unclear or you need more information, explain what you need.
+If the path is not allowed, explain why and suggest an allowed path."
+
+    local response
+    response=$("${SCRIPTS_DIR}/gemini-exec" "$prompt" 2>&1) || {
+        log_err "Gemini invocation failed"
+        return 1
+    }
+
+    # Check if Gemini responded with a write request
+    if [[ "$response" =~ WRITE[[:space:]]FILE: ]]; then
+        local filepath=$(echo "$response" | grep -oP 'WRITE FILE:\s*\K[^\s]+')
+        local content=$(echo "$response" | sed -n '/^```/,/^```$/p' | sed '1d;$d')
+
+        if [[ -z "$content" ]]; then
+            content=$(echo "$response" | sed -n '/^```[a-z]*/,/^```$/p' | sed '1d;$d')
+        fi
+
+        if [[ -n "$filepath" ]] && [[ -n "$content" ]]; then
+            local result
+            if result=$(write_file "$filepath" "$content" 2>&1); then
+                echo "SUCCESS: File written to $filepath"
+                echo "$result"
+                echo ""
+                echo "Content preview (first 10 lines):"
+                echo "$content" | head -10
+            else
+                echo "FAILED: Could not write file"
+                echo "$result"
+            fi
+        else
+            echo "$response"
+        fi
+    else
+        echo "$response"
+    fi
+}
+
+# Post response to channel
+post_response() {
+    local response_text="$1"
+    local in_reply_to="$2"
+
+    python3 << EOF
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import secrets
+
+now = datetime.now(timezone.utc)
+msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-code2-{secrets.token_hex(2)}"
+
+msg = {
+    "id": msg_id,
+    "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    "session_id": "${CHANNEL}",
+    "from": "code-2",
+    "to": "all",
+    "type": "code",
+    "content": {
+        "text": """${response_text}""",
+        "code": None,
+        "artifacts": []
+    },
+    "metadata": {
+        "mode": "watcher",
+        "model": "gemini-2.5-flash",
+        "role": "code_worker",
+        "in_reply_to": "${in_reply_to}"
+    }
+}
+
+path = Path("${CHANNEL_DIR}") / f"{msg_id}.json"
+path.write_text(json.dumps(msg, indent=2) + "\n")
+print(f"Posted: {msg_id}")
+EOF
+}
+
+# Main watch loop
+main() {
+    log_info "Starting code-2 (Code Worker) watcher"
+    log_info "Channel: ${CHANNEL}"
+    log_info "Model: Gemini Flash (Tier 1)"
+    log_info "Reports to: code-1"
+    log_info "Allowed paths: ${ALLOWED_PATHS[*]}"
+
+    if ! command -v inotifywait &> /dev/null; then
+        log_err "inotifywait not found"
+        exit 1
+    fi
+
+    update_presence "IDLE"
+    log_ok "Presence updated"
+
+    declare -A processed
+    for f in "${CHANNEL_DIR}"/msg-*.json; do
+        [[ -f "$f" ]] && processed["$(basename "$f")"]=1
+    done
+    log_info "Marked ${#processed[@]} existing messages as read"
+
+    inotifywait -m -e create -e moved_to "${CHANNEL_DIR}" --format '%f' 2>/dev/null | while read -r filename; do
+        [[ "$filename" != msg-*.json ]] && continue
+        [[ -n "${processed[$filename]}" ]] && continue
+        processed["$filename"]=1
+
+        local filepath="${CHANNEL_DIR}/${filename}"
+        sleep 0.5
+
+        if is_from_us "$filepath"; then
+            log_info "Skipping own message"
+            continue
+        fi
+
+        if ! is_for_us "$filepath"; then
+            continue
+        fi
+
+        log_info "New code request: ${filename}"
+        update_presence "WRITING"
+
+        local msg_id=$(jq -r '.id' "$filepath" 2>/dev/null)
+
+        local response
+        if response=$(invoke_code_worker "$filepath"); then
+            if [[ -n "$response" ]]; then
+                post_response "$response" "$msg_id"
+                log_ok "Response posted"
+            fi
+        else
+            log_err "Request processing failed"
+            post_response "ERROR: Failed to process code request" "$msg_id"
+        fi
+
+        update_presence "IDLE"
+    done
+}
+
+cleanup() {
+    log_info "Shutting down code-2 watcher..."
+    update_presence "OFFLINE"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+main "$@"
