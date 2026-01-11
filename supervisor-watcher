@@ -364,7 +364,8 @@ main() {
 
                 # Check if response contains an assignment directive
                 if echo "$response" | grep -q "ASSIGN TO:"; then
-                    local target=$(echo "$response" | grep "ASSIGN TO:" | head -1 | sed 's/ASSIGN TO: *//')
+                    # Extract target, stripping markdown formatting (asterisks, etc.)
+                    local target=$(echo "$response" | grep "ASSIGN TO:" | head -1 | sed 's/ASSIGN TO: *//' | sed 's/\*//g' | sed 's/^ *//' | awk '{print $1}')
                     if [[ -n "$target" ]]; then
                         log_info "Detected assignment to: ${target}"
                         # Extract task portion for directive
