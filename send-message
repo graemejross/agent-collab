@@ -72,8 +72,22 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Get message text
-MESSAGE="$*"
+# Check if first positional arg looks like a recipient
+# Pattern: agent names like codex-1, claude-1, gemini-1, ha-mgr-1, bags-1, all, human
+FIRST_ARG="${1:-}"
+if [[ -n "$FIRST_ARG" ]] && [[ "$FIRST_ARG" =~ ^(all|human|claude-[0-9]+|codex-[0-9]+|gemini-[0-9]+|ha-mgr-[0-9]+|bags-[0-9]+|qc-[0-9]+|docs-[0-9]+|triage-[0-9]+|supervisor)$ ]]; then
+    # First arg is a recipient
+    TO="$FIRST_ARG"
+    shift
+    MESSAGE="$*"
+    # Prepend recipient to message text for readability (unless sending to "all")
+    if [[ "$TO" != "all" ]]; then
+        MESSAGE="${TO} ${MESSAGE}"
+    fi
+else
+    # No recipient specified, treat all args as message
+    MESSAGE="$*"
+fi
 
 if [[ -z "$MESSAGE" ]]; then
     echo "Error: No message provided" >&2
