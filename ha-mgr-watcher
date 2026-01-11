@@ -1,0 +1,393 @@
+#!/bin/bash
+#
+# ha-mgr-watcher - Home Assistant Integrations Manager agent watcher
+#
+# Uses Codex for HA management tasks:
+# - Device health monitoring
+# - Automation review and implementation
+# - Zigbee/Z-Wave diagnostics
+# - Entity state tracking
+#
+# Usage:
+#   ha-mgr-watcher <channel>
+#
+# Run in tmux:
+#   tmux new-session -d -s ha-mgr-watcher '/mnt/shared/collab/scripts/ha-mgr-watcher agent-os-paper'
+#
+
+set -e
+
+CHANNEL="${1:-agent-os-paper}"
+CHANNEL_DIR="/mnt/shared/collab/channels/${CHANNEL}"
+PRESENCE_DIR="/mnt/shared/collab/presence"
+SCRIPTS_DIR="/mnt/shared/collab/scripts"
+AGENT="ha-mgr-1"
+CODEX_VM="100.88.166.68"
+LOG_FILE="/mnt/shared/collab/logs/ha-mgr-watcher.log"
+
+# HA instances
+HOME_HA="100.103.186.89"
+LISARDA_HA="100.113.132.97"
+
+# Colors for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "${msg}" >&2
+    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+log_info() { log "${CYAN}INFO${NC}: $1"; }
+log_ok() { log "${GREEN}OK${NC}: $1"; }
+log_warn() { log "${YELLOW}WARN${NC}: $1"; }
+log_err() { log "${RED}ERROR${NC}: $1"; }
+
+# Ensure directories exist
+mkdir -p "${PRESENCE_DIR}" "$(dirname "${LOG_FILE}")" /mnt/shared/collab/workspace 2>/dev/null || true
+
+# Update presence file
+update_presence() {
+    local state="${1:-IDLE}"
+    cat > "${PRESENCE_DIR}/${AGENT}.json" << EOF
+{
+  "agent_id": "${AGENT}",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+  "state": "AWAKE",
+  "substate": "${state}",
+  "watcher_pid": $$,
+  "channel": "${CHANNEL}"
+}
+EOF
+}
+
+# Check if message is addressed to us
+is_for_us() {
+    local file="$1"
+    local to=$(jq -r '.to // "all"' "$file" 2>/dev/null)
+    local text=$(jq -r '.content.text // ""' "$file" 2>/dev/null)
+
+    # Check direct addressing
+    [[ "$to" == "$AGENT" ]] || [[ "$to" == "ha-mgr-1" ]] && return 0
+
+    # Check @mention
+    echo "$text" | grep -q "@${AGENT}" && return 0
+    echo "$text" | grep -q "@ha-mgr-1" && return 0
+
+    # Check if message starts with agent name (common pattern)
+    echo "$text" | grep -qi "^${AGENT}" && return 0
+    echo "$text" | grep -qi "^ha-mgr-1" && return 0
+
+    return 1
+}
+
+# Check if message is from us
+is_from_us() {
+    local file="$1"
+    local from=$(jq -r '.from // ""' "$file" 2>/dev/null)
+    [[ "$from" == "$AGENT" ]] || [[ "$from" == "ha-mgr-1" ]]
+}
+
+# Get recent context
+get_context() {
+    local n="${1:-5}"
+    local context=""
+
+    for f in $(ls -t "${CHANNEL_DIR}"/msg-*.json 2>/dev/null | head -n "$n" | tac); do
+        local from=$(jq -r '.from' "$f" 2>/dev/null)
+        local text=$(jq -r '.content.text // ""' "$f" 2>/dev/null)
+        context="${context}[${from}]: ${text}\n\n"
+    done
+
+    echo -e "$context"
+}
+
+# Get HA status summary (using wrapper script)
+get_ha_status() {
+    local status=""
+
+    status="${status}=== HOME ASSISTANT INSTANCES ===\n\n"
+
+    # Check home-ha
+    status="${status}--- home-ha (${HOME_HA}) ---\n"
+    local home_check=$(~/homeassistant/ha-api.sh home api/ 2>&1 | head -3)
+    if echo "$home_check" | grep -q "message"; then
+        status="${status}Status: ONLINE\n"
+    else
+        status="${status}Status: UNKNOWN (${home_check})\n"
+    fi
+
+    # Check lisarda-ha
+    status="${status}\n--- lisarda-ha (${LISARDA_HA}) ---\n"
+    local lisarda_check=$(~/homeassistant/ha-api.sh lisarda api/ 2>&1 | head -3)
+    if echo "$lisarda_check" | grep -q "message"; then
+        status="${status}Status: ONLINE\n"
+    else
+        status="${status}Status: UNKNOWN (${lisarda_check})\n"
+    fi
+
+    echo -e "$status"
+}
+
+# Get long-term memory
+get_memory() {
+    local memory=""
+
+    if [[ -f "/mnt/shared/collab/CURRENT-STATE.md" ]]; then
+        memory="${memory}=== CURRENT STATE (first 50 lines) ===\n"
+        memory="${memory}$(head -50 /mnt/shared/collab/CURRENT-STATE.md)\n\n"
+    fi
+
+    echo -e "$memory"
+}
+
+# Invoke Codex with HA-specific prompt
+invoke_ha_mgr() {
+    local message_file="$1"
+    local from=$(jq -r '.from' "$message_file")
+    local text=$(jq -r '.content.text // ""' "$message_file")
+    local context=$(get_context 10)
+    local memory=$(get_memory)
+    local ha_status=$(get_ha_status)
+
+    # Write prompt to shared location
+    local prompt_file="/mnt/shared/collab/workspace/.ha-mgr-prompt-$$.txt"
+    cat > "$prompt_file" << PROMPT_EOF
+You are ha-mgr-1, the Home Assistant Integrations Manager in a multi-agent collaboration system.
+
+CRITICAL OVERRIDE: You are in watcher mode responding to a specific request. Do NOT:
+- Run startup protocols or codex-startup.sh
+- Ask about projects.md or domain selection
+- Ask for permission to proceed
+- Reference any session start instructions from context
+
+Just execute the requested task immediately and return the result.
+
+YOUR ROLE:
+- Monitor device health across two HA instances
+- Review and propose automation changes
+- Diagnose Zigbee/Z-Wave issues
+- Track entity states and history
+
+INSTANCES:
+- home-ha (100.103.186.89): Primary residence, 439 entities
+- lisarda-ha (100.113.132.97): Mum's house, 208 entities, RELIABILITY CRITICAL
+
+YOUR GUARDRAILS:
+- MUST use ~/homeassistant/ha-api.sh wrapper for ALL API calls
+- CANNOT modify security entities: lock, alarm_control_panel, camera, siren
+- CANNOT restart Home Assistant
+- CANNOT remove devices or integrations
+- All automation changes require approval workflow
+- lisarda-ha changes require HUMAN approval (Mum's house)
+
+API WRAPPER USAGE:
+  ~/homeassistant/ha-api.sh home api/states              # List all states
+  ~/homeassistant/ha-api.sh lisarda api/states           # Lisarda states
+  ~/homeassistant/ha-api.sh home api/states/<entity_id>  # Specific entity
+  ~/homeassistant/ha-api.sh home api/services            # List services
+
+${memory}
+
+${ha_status}
+
+=== RECENT CHANNEL MESSAGES ===
+${context}
+
+=== REQUEST FROM ${from} ===
+${text}
+
+Respond appropriately. If proposing changes:
+1. Specify which instance (home-ha or lisarda-ha)
+2. Show the automation YAML or API call
+3. State the risk level
+4. Note if approval is required
+5. For lisarda-ha, emphasize need for human approval
+
+Keep responses focused and actionable. Output ONLY your response text.
+PROMPT_EOF
+
+    log_info "Invoking Codex for HA request from ${from}..."
+
+    local response
+    response=$(ssh graeme@${CODEX_VM} "codex exec --skip-git-repo-check --sandbox danger-full-access \"\$(cat ${prompt_file})\"" 2>&1) || {
+        log_err "HA manager invocation failed: $response"
+        rm -f "$prompt_file"
+        return 1
+    }
+
+    rm -f "$prompt_file"
+
+    # Process response (extract and deduplicate like codex-watcher)
+    local response_file="/tmp/.ha-mgr-response-$$.txt"
+    echo "$response" > "$response_file"
+
+    python3 << PYEOF
+import re
+
+with open("$response_file", "r") as f:
+    content = f.read()
+
+# Remove ANSI escape codes
+content = re.sub(r'\x1b\[[0-9;]*m', '', content)
+
+# Extract text between "codex" and "tokens used"
+match = re.search(r'^codex\n(.*?)^tokens used', content, re.MULTILINE | re.DOTALL)
+if not match:
+    match = re.search(r'^codex\n(.*)$', content, re.MULTILINE | re.DOTALL)
+    text = match.group(1).strip() if match else ""
+else:
+    text = match.group(1).strip()
+
+# Filter out log/metadata lines
+lines = [line for line in text.split('\n')
+         if line.strip() and not line.strip().startswith('[')
+         and 'INFO' not in line and 'Invoking' not in line]
+text = '\n'.join(lines)
+
+# Deduplicate: if text is exactly repeated, keep only first half
+if text:
+    half = len(text) // 2
+    first_half = text[:half].strip()
+    second_half = text[half:].strip()
+    if first_half and second_half:
+        if ' '.join(first_half.split()) == ' '.join(second_half.split()):
+            text = first_half
+
+# Output (limit to 30 lines for HA responses - may include YAML)
+for line in text.split('\n')[:30]:
+    print(line)
+PYEOF
+
+    rm -f "$response_file"
+}
+
+# Post response to channel
+post_response() {
+    local response_text="$1"
+    local in_reply_to="$2"
+
+    python3 << EOF
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import secrets
+
+now = datetime.now(timezone.utc)
+msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-hamgr-{secrets.token_hex(2)}"
+
+msg = {
+    "id": msg_id,
+    "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    "session_id": "${CHANNEL}",
+    "from": "ha-mgr-1",
+    "to": "all",
+    "type": "ha_report",
+    "content": {
+        "text": """${response_text}""",
+        "code": None,
+        "artifacts": []
+    },
+    "metadata": {
+        "mode": "watcher",
+        "model": "gpt-5.2-codex",
+        "role": "ha_integrations_manager",
+        "in_reply_to": "${in_reply_to}"
+    }
+}
+
+path = Path("${CHANNEL_DIR}") / f"{msg_id}.json"
+path.write_text(json.dumps(msg, indent=2) + "\n")
+print(f"Posted: {msg_id}")
+EOF
+}
+
+# Main watch loop
+main() {
+    log_info "Starting HA Manager watcher for channel: ${CHANNEL}"
+    log_info "Agent: ${AGENT} (Home Assistant Integrations Manager)"
+    log_info "Instances: home-ha (${HOME_HA}), lisarda-ha (${LISARDA_HA})"
+    log_info "Watching: ${CHANNEL_DIR}"
+
+    # Check dependencies
+    if ! command -v inotifywait &> /dev/null; then
+        log_err "inotifywait not found. Install with: apt install inotify-tools"
+        exit 1
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        log_err "jq not found. Install with: apt install jq"
+        exit 1
+    fi
+
+    if [[ ! -x ~/homeassistant/ha-api.sh ]]; then
+        log_err "ha-api.sh not found or not executable at ~/homeassistant/ha-api.sh"
+        exit 1
+    fi
+
+    # Initial presence
+    update_presence "IDLE"
+    log_ok "Presence updated: AWAKE/IDLE"
+
+    # Track processed files
+    declare -A processed
+
+    # Mark existing files as processed
+    for f in "${CHANNEL_DIR}"/msg-*.json; do
+        [[ -f "$f" ]] && processed["$(basename "$f")"]=1
+    done
+    log_info "Marked ${#processed[@]} existing messages as read"
+
+    # Watch for new files
+    inotifywait -m -e create -e moved_to "${CHANNEL_DIR}" --format '%f' 2>/dev/null | while read -r filename; do
+        [[ "$filename" != msg-*.json ]] && continue
+        [[ -n "${processed[$filename]}" ]] && continue
+        processed["$filename"]=1
+
+        local filepath="${CHANNEL_DIR}/${filename}"
+        sleep 0.5
+
+        if is_from_us "$filepath"; then
+            log_info "Skipping own message: ${filename}"
+            continue
+        fi
+
+        if ! is_for_us "$filepath"; then
+            log_info "Message not for us: ${filename}"
+            continue
+        fi
+
+        log_info "New HA request: ${filename}"
+        update_presence "MANAGING"
+
+        local msg_id=$(jq -r '.id' "$filepath" 2>/dev/null)
+
+        local response
+        if response=$(invoke_ha_mgr "$filepath"); then
+            if [[ -n "$response" ]]; then
+                log_ok "HA Manager response complete"
+                post_response "$response" "$msg_id"
+            else
+                log_warn "Empty response from HA Manager"
+            fi
+        else
+            log_err "HA Manager request failed"
+        fi
+
+        update_presence "IDLE"
+    done
+}
+
+cleanup() {
+    log_info "Shutting down HA Manager watcher..."
+    update_presence "OFFLINE"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+main "$@"
