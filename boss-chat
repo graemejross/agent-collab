@@ -40,9 +40,73 @@ except ImportError:
 
 COLLAB_DIR = Path("/mnt/shared/collab")
 CHANNEL_DIR = COLLAB_DIR / "channels" / "human-supervisor"
+TEAM_CHANNEL_DIR = COLLAB_DIR / "channels" / "agent-os-paper"
 SCRIPTS_DIR = COLLAB_DIR / "scripts"
 
 console = Console() if RICH_AVAILABLE else None
+
+def get_team_activity(since_timestamp: str = None, n: int = 5) -> list:
+    """Get recent messages from team channel."""
+    messages = []
+    msg_files = sorted(TEAM_CHANNEL_DIR.glob("msg-*.json"), reverse=True)[:20]
+
+    for f in reversed(msg_files):
+        try:
+            with open(f) as fp:
+                msg = json.load(fp)
+                # Skip supervisor messages (already shown)
+                if msg.get('from') == 'supervisor':
+                    continue
+                # Skip human messages
+                if msg.get('from') in ('human', 'graeme'):
+                    continue
+
+                ts = msg.get('timestamp', '')
+                if since_timestamp and ts <= since_timestamp:
+                    continue
+
+                messages.append({
+                    'from': msg.get('from', 'unknown'),
+                    'text': msg.get('content', {}).get('text', '')[:200],  # Truncate
+                    'timestamp': ts,
+                })
+        except:
+            pass
+
+    return messages[-n:]  # Return last n
+
+def show_team_activity(since_timestamp: str = None) -> None:
+    """Show recent team channel activity."""
+    activity = get_team_activity(since_timestamp, n=5)
+
+    if not activity:
+        return
+
+    if RICH_AVAILABLE:
+        console.print("\n[dim]─── Team Activity ───[/dim]")
+        for msg in activity:
+            sender = msg['from']
+            text = msg['text']
+            if len(text) > 150:
+                text = text[:150] + "..."
+            # Color code by agent type
+            if 'codex' in sender:
+                color = "green"
+            elif 'gemini' in sender:
+                color = "blue"
+            elif 'claude' in sender:
+                color = "magenta"
+            elif 'code-' in sender:
+                color = "yellow"
+            elif 'docs-' in sender:
+                color = "cyan"
+            else:
+                color = "white"
+            console.print(f"  [{color}]{sender}[/{color}]: {text}")
+    else:
+        print("\n--- Team Activity ---")
+        for msg in activity:
+            print(f"  {msg['from']}: {msg['text'][:100]}...")
 
 def send_message(text: str) -> str:
     """Send a message to the supervisor channel."""
@@ -153,6 +217,7 @@ def show_help() -> None:
 | Command | Description |
 |---------|-------------|
 | `status` | Get team status from supervisor |
+| `team` | Show recent team channel activity |
 | `history` | Show recent conversation |
 | `clear` | Clear the screen |
 | `help` | Show this help |
@@ -230,6 +295,24 @@ def interactive_mode() -> None:
                 show_history(15)
                 continue
 
+            elif cmd == 'team':
+                if RICH_AVAILABLE:
+                    console.print("\n[bold]Recent Team Activity[/bold]")
+                else:
+                    print("\nRecent Team Activity")
+                activity = get_team_activity(n=10)
+                if activity:
+                    for msg in activity:
+                        sender = msg['from']
+                        text = msg['text']
+                        if RICH_AVAILABLE:
+                            console.print(f"  [cyan]{sender}[/cyan]: {text}")
+                        else:
+                            print(f"  {sender}: {text}")
+                else:
+                    print("  No recent activity")
+                continue
+
             # Send message to supervisor
             if RICH_AVAILABLE:
                 with console.status("[cyan]Sending to supervisor...[/cyan]"):
@@ -248,6 +331,8 @@ def interactive_mode() -> None:
 
             if response:
                 format_message(response)
+                # Show team activity after supervisor response
+                show_team_activity(response.get('timestamp'))
             else:
                 if RICH_AVAILABLE:
                     console.print("[dim]No response received (timeout)[/dim]")
@@ -282,6 +367,8 @@ def single_command(cmd: str) -> None:
 
     if response:
         format_message(response)
+        # Show team activity after supervisor response
+        show_team_activity(response.get('timestamp'))
     else:
         print("No response received")
 
