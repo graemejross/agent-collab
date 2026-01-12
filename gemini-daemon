@@ -30,7 +30,7 @@ from pathlib import Path
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Configuration
-AGENT_ID = "gemini-1"
+AGENT_ID = "gemini"
 CHANNEL = sys.argv[1] if len(sys.argv) > 1 else "agent-os-paper"
 CHANNEL_DIR = Path(f"/mnt/shared/collab/channels/{CHANNEL}")
 PRESENCE_DIR = Path("/mnt/shared/collab/signals/presence")
@@ -237,7 +237,7 @@ def is_for_us(msg_file):
             return True, sender, text, msg.get("id")
         
         # Mentioned in text
-        if f"@{AGENT_ID}" in text or "gemini-1" in text or "gemini" in text.lower():
+        if f"@{AGENT_ID}" in text or "gemini" in text or "gemini" in text.lower():
             return True, sender, text, msg.get("id")
         
         return False, None, None, None

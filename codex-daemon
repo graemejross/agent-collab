@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-AGENT_ID="codex-1"
+AGENT_ID="codex"
 CHANNEL="${1:-agent-os-paper}"
 CHANNEL_DIR="/mnt/shared/collab/channels/${CHANNEL}"
 PRESENCE_DIR="/mnt/shared/collab/signals/presence"
