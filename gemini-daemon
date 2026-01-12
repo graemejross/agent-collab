@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""
+gemini-daemon - Persistent Gemini agent with file-based context
+
+Unlike gemini-watcher which invokes Gemini fresh each time (stateless),
+gemini-daemon maintains context by storing conversation history in a file.
+
+Usage:
+    gemini-daemon <channel>
+
+The daemon:
+1. Loads conversation history from /mnt/shared/collab/sessions/gemini-1.context
+2. Watches for messages using inotifywait (zero AI tokens)
+3. For each message, includes full history in prompt for context
+4. Saves response to history
+5. On shutdown, preserves history for next startup
+"""
+
+import os
+import sys
+import json
+import time
+import subprocess
+import signal
+import warnings
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# Suppress warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Configuration
+AGENT_ID = "gemini-1"
+CHANNEL = sys.argv[1] if len(sys.argv) > 1 else "agent-os-paper"
+CHANNEL_DIR = Path(f"/mnt/shared/collab/channels/{CHANNEL}")
+PRESENCE_DIR = Path("/mnt/shared/collab/signals/presence")
+SESSION_FILE = Path(f"/mnt/shared/collab/sessions/{AGENT_ID}.session")
+CONTEXT_FILE = Path(f"/mnt/shared/collab/sessions/{AGENT_ID}.context")
+LOG_FILE = Path(f"/mnt/shared/collab/logs/{AGENT_ID}-daemon.log")
+MODEL = "gemini-2.5-flash"
+MAX_CONTEXT_MESSAGES = 20  # Keep last N messages for context
+SESSION_EXPIRY_HOURS = 8
+
+# Colors
+BLUE = '\033[0;34m'
+GREEN = '\033[0;32m'
+YELLOW = '\033[0;33m'
+RED = '\033[0;31m'
+NC = '\033[0m'
+
+def log(level, color, msg):
+    """Log to file and stderr."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f"[{timestamp}] {color}{level}{NC}: {msg}"
+    print(line, file=sys.stderr)
+    with open(LOG_FILE, 'a') as f:
+        f.write(f"[{timestamp}] {level}: {msg}\n")
+
+def log_info(msg): log("INFO", BLUE, msg)
+def log_ok(msg): log("OK", GREEN, msg)
+def log_warn(msg): log("WARN", YELLOW, msg)
+def log_err(msg): log("ERROR", RED, msg)
+
+def load_credentials():
+    """Load Gemini API key."""
+    if os.environ.get("GEMINI_API_KEY"):
+        return os.environ["GEMINI_API_KEY"]
+    
+    creds_file = Path.home() / ".credentials"
+    if creds_file.exists():
+        with open(creds_file) as f:
+            for line in f:
+                if line.startswith("export GEMINI_API_KEY="):
+                    value = line.split("=", 1)[1].strip()
+                    return value.strip('"').strip("'")
+    return None
+
+def load_context():
+    """Load conversation history from file."""
+    if CONTEXT_FILE.exists():
+        try:
+            with open(CONTEXT_FILE) as f:
+                data = json.load(f)
+                # Check if context is still fresh
+                last_used = data.get("last_used", "")
+                if last_used:
+                    last_time = datetime.fromisoformat(last_used.replace("Z", "+00:00"))
+                    age = datetime.now(timezone.utc) - last_time
+                    if age > timedelta(hours=SESSION_EXPIRY_HOURS):
+                        log_warn(f"Context expired (age: {age}), starting fresh")
+                        return {"messages": [], "started": None}
+                return data
+        except Exception as e:
+            log_warn(f"Failed to load context: {e}")
+    return {"messages": [], "started": None}
+
+def save_context(context):
+    """Save conversation history to file."""
+    context["last_used"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not context.get("started"):
+        context["started"] = context["last_used"]
+    
+    # Trim to max messages
+    if len(context.get("messages", [])) > MAX_CONTEXT_MESSAGES:
+        context["messages"] = context["messages"][-MAX_CONTEXT_MESSAGES:]
+    
+    with open(CONTEXT_FILE, 'w') as f:
+        json.dump(context, f, indent=2)
+
+def save_session_info(context):
+    """Save session metadata."""
+    session = {
+        "agent_id": AGENT_ID,
+        "channel": CHANNEL,
+        "started": context.get("started"),
+        "last_used": context.get("last_used"),
+        "message_count": len(context.get("messages", [])),
+        "model": MODEL
+    }
+    with open(SESSION_FILE, 'w') as f:
+        json.dump(session, f, indent=2)
+
+def build_system_prompt():
+    """Build the system prompt for Gemini."""
+    return f"""You are {AGENT_ID}, a persistent AI agent in a multi-agent collaboration system.
+
+You maintain context across messages - you remember previous conversations in this session.
+You're watching the '{CHANNEL}' channel.
+
+Your capabilities:
+- Code review and suggestions
+- Technical analysis
+- Problem solving
+- Collaboration with other agents (claude-1, codex-1, etc.)
+
+When you receive messages:
+- Remember context from previous messages in this session
+- Track ongoing discussions
+- Provide helpful, concise responses
+- Collaborate effectively with the team
+
+Keep responses focused and relevant."""
+
+def build_prompt_with_context(context, new_message, sender):
+    """Build a prompt that includes conversation history."""
+    system = build_system_prompt()
+    
+    # Build conversation history
+    history_parts = []
+    for msg in context.get("messages", []):
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        history_parts.append(f"[{role}]: {content}")
+    
+    history_text = "\n".join(history_parts) if history_parts else "(No previous messages in this session)"
+    
+    prompt = f"""{system}
+
+=== CONVERSATION HISTORY ===
+{history_text}
+
+=== NEW MESSAGE ===
+[{sender}]: {new_message}
+
+Respond to the new message. You have full context from the conversation history above."""
+    
+    return prompt
+
+def invoke_gemini(prompt, api_key):
+    """Call Gemini API and return response."""
+    try:
+        import google.generativeai as genai
+        
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(MODEL)
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        log_err(f"Gemini API error: {e}")
+        return None
+
+def update_presence(state, substate):
+    """Update presence file."""
+    presence = {
+        "agent_id": AGENT_ID,
+        "state": state,
+        "substate": substate,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "channel": CHANNEL,
+        "mode": "daemon",
+        "session_persistent": True
+    }
+    PRESENCE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PRESENCE_DIR / f"{AGENT_ID}.json", 'w') as f:
+        json.dump(presence, f, indent=2)
+
+def post_response(response, in_reply_to):
+    """Post response to channel."""
+    import secrets
+    
+    now = datetime.now(timezone.utc)
+    msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-gemini-{secrets.token_hex(2)}"
+    
+    msg = {
+        "id": msg_id,
+        "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "session_id": CHANNEL,
+        "from": AGENT_ID,
+        "to": "all",
+        "type": "chat",
+        "content": {"text": response, "code": None, "artifacts": []},
+        "metadata": {"mode": "daemon", "session_persistent": True, "in_reply_to": in_reply_to}
+    }
+    
+    outfile = CHANNEL_DIR / f"{msg_id}.json"
+    with open(outfile, 'w') as f:
+        json.dump(msg, f, indent=2)
+    
+    log_info(f"Posted: {msg_id}")
+
+def is_for_us(msg_file):
+    """Check if message is addressed to us."""
+    try:
+        with open(msg_file) as f:
+            msg = json.load(f)
+        
+        sender = msg.get("from", "")
+        to = msg.get("to", "all")
+        text = msg.get("content", {}).get("text", "")
+        
+        # Skip our own messages
+        if sender == AGENT_ID:
+            return False, None, None, None
+        
+        # Direct message to us
+        if to == AGENT_ID:
+            return True, sender, text, msg.get("id")
+        
+        # Mentioned in text
+        if f"@{AGENT_ID}" in text or "gemini-1" in text or "gemini" in text.lower():
+            return True, sender, text, msg.get("id")
+        
+        return False, None, None, None
+    except Exception as e:
+        log_err(f"Error reading message: {e}")
+        return False, None, None, None
+
+def main():
+    log_info(f"Starting {AGENT_ID} daemon (persistent session mode)")
+    log_info(f"Channel: {CHANNEL}")
+    log_info(f"Model: {MODEL}")
+    
+    # Ensure directories exist
+    CHANNEL_DIR.mkdir(parents=True, exist_ok=True)
+    PRESENCE_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load API key
+    api_key = load_credentials()
+    if not api_key:
+        log_err("GEMINI_API_KEY not found")
+        sys.exit(1)
+    
+    # Load or create context
+    context = load_context()
+    if context.get("messages"):
+        log_ok(f"Resuming session with {len(context['messages'])} messages in history")
+    else:
+        log_info("Starting fresh session")
+        context = {"messages": [], "started": None}
+    
+    save_context(context)
+    save_session_info(context)
+    
+    update_presence("AWAKE", "IDLE")
+    log_ok("Presence updated: AWAKE/IDLE")
+    
+    # Mark existing messages as seen
+    seen_messages = set()
+    for f in CHANNEL_DIR.glob("msg-*.json"):
+        seen_messages.add(f.name)
+    log_info(f"Marked {len(seen_messages)} existing messages as read")
+    
+    # Setup signal handlers
+    def cleanup(signum=None, frame=None):
+        log_info(f"Shutting down {AGENT_ID} daemon...")
+        update_presence("SLEEPING", "SHUTDOWN")
+        log_ok(f"Daemon stopped. Context preserved in {CONTEXT_FILE}")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    
+    log_info("Watching for messages... Press Ctrl+C to stop")
+    
+    # Watch for new messages using inotifywait
+    while True:
+        try:
+            result = subprocess.run(
+                ["inotifywait", "-q", "-e", "create", "-e", "moved_to", 
+                 str(CHANNEL_DIR), "--format", "%f"],
+                capture_output=True, text=True, timeout=300
+            )
+            
+            if result.returncode != 0:
+                continue
+            
+            filename = result.stdout.strip()
+            if not filename.startswith("msg-") or not filename.endswith(".json"):
+                continue
+            
+            if filename in seen_messages:
+                continue
+            
+            seen_messages.add(filename)
+            filepath = CHANNEL_DIR / filename
+            
+            if not filepath.exists():
+                continue
+            
+            is_ours, sender, text, msg_id = is_for_us(filepath)
+            
+            if is_ours:
+                log_info(f"New message for us: {filename}")
+                update_presence("AWAKE", "WORKING")
+                
+                # Build prompt with context
+                prompt = build_prompt_with_context(context, text, sender)
+                
+                # Call Gemini
+                log_info(f"Invoking Gemini for message from {sender}...")
+                response = invoke_gemini(prompt, api_key)
+                
+                if response:
+                    # Update context with this exchange
+                    context["messages"].append({"role": sender, "content": text})
+                    context["messages"].append({"role": AGENT_ID, "content": response})
+                    save_context(context)
+                    save_session_info(context)
+                    
+                    # Post response
+                    post_response(response, msg_id)
+                    log_ok("Response posted")
+                else:
+                    log_err("Failed to get response from Gemini")
+                
+                update_presence("AWAKE", "IDLE")
+            else:
+                log_info(f"Message not for us: {filename}")
+                
+        except subprocess.TimeoutExpired:
+            # inotifywait timeout - just continue
+            continue
+        except Exception as e:
+            log_err(f"Error in main loop: {e}")
+            time.sleep(1)
+
+if __name__ == "__main__":
+    main()

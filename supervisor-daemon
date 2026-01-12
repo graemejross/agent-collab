@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""
+supervisor-daemon - Persistent Supervisor agent with conversation history
+
+Uses Claude Sonnet via Anthropic API with native message history for context.
+Maintains persistent memory across messages and restarts.
+
+Usage:
+    supervisor-daemon
+"""
+
+import os
+import sys
+import json
+import time
+import subprocess
+import signal
+import warnings
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+# Configuration
+AGENT_ID = "supervisor"
+HUMAN_CHANNEL = Path("/mnt/shared/collab/channels/human-supervisor")
+TEAM_CHANNEL = Path("/mnt/shared/collab/channels/agent-os-paper")
+PRESENCE_DIR = Path("/mnt/shared/collab/signals/presence")
+REGISTRY_DIR = Path("/mnt/shared/collab/registry/agents")
+SESSION_FILE = Path(f"/mnt/shared/collab/sessions/{AGENT_ID}.session")
+CONTEXT_FILE = Path(f"/mnt/shared/collab/sessions/{AGENT_ID}.context")
+LOG_FILE = Path(f"/mnt/shared/collab/logs/{AGENT_ID}-daemon.log")
+MODEL = "claude-sonnet-4-20250514"
+MAX_CONTEXT_MESSAGES = 30  # Keep more context for supervisor
+SESSION_EXPIRY_HOURS = 8
+
+# Colors
+BLUE = '\033[0;34m'
+GREEN = '\033[0;32m'
+YELLOW = '\033[0;33m'
+RED = '\033[0;31m'
+CYAN = '\033[0;36m'
+NC = '\033[0m'
+
+def log(level, color, msg):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f"[{timestamp}] {color}{level}{NC}: {msg}"
+    print(line, file=sys.stderr)
+    with open(LOG_FILE, 'a') as f:
+        f.write(f"[{timestamp}] {level}: {msg}\n")
+
+def log_info(msg): log("INFO", BLUE, msg)
+def log_ok(msg): log("OK", GREEN, msg)
+def log_warn(msg): log("WARN", YELLOW, msg)
+def log_err(msg): log("ERROR", RED, msg)
+def log_cmd(msg): log("CMD", CYAN, msg)
+
+def load_credentials():
+    """Load Anthropic API key."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return os.environ["ANTHROPIC_API_KEY"]
+    
+    creds_file = Path.home() / ".credentials"
+    if creds_file.exists():
+        with open(creds_file) as f:
+            for line in f:
+                if line.startswith("export ANTHROPIC_API_KEY="):
+                    value = line.split("=", 1)[1].strip()
+                    return value.strip('"').strip("'")
+    return None
+
+def load_context():
+    """Load conversation history from file."""
+    if CONTEXT_FILE.exists():
+        try:
+            with open(CONTEXT_FILE) as f:
+                data = json.load(f)
+                last_used = data.get("last_used", "")
+                if last_used:
+                    last_time = datetime.fromisoformat(last_used.replace("Z", "+00:00"))
+                    age = datetime.now(timezone.utc) - last_time
+                    if age > timedelta(hours=SESSION_EXPIRY_HOURS):
+                        log_warn(f"Context expired (age: {age}), starting fresh")
+                        return {"messages": [], "started": None}
+                return data
+        except Exception as e:
+            log_warn(f"Failed to load context: {e}")
+    return {"messages": [], "started": None}
+
+def save_context(context):
+    """Save conversation history to file."""
+    context["last_used"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not context.get("started"):
+        context["started"] = context["last_used"]
+    
+    if len(context.get("messages", [])) > MAX_CONTEXT_MESSAGES:
+        context["messages"] = context["messages"][-MAX_CONTEXT_MESSAGES:]
+    
+    with open(CONTEXT_FILE, 'w') as f:
+        json.dump(context, f, indent=2)
+
+def save_session_info(context):
+    """Save session metadata."""
+    session = {
+        "agent_id": AGENT_ID,
+        "channel": "human-supervisor",
+        "started": context.get("started"),
+        "last_used": context.get("last_used"),
+        "message_count": len(context.get("messages", [])),
+        "model": MODEL
+    }
+    with open(SESSION_FILE, 'w') as f:
+        json.dump(session, f, indent=2)
+
+def get_agent_registry():
+    """Get agent registry info."""
+    registry = []
+    if REGISTRY_DIR.exists():
+        for f in REGISTRY_DIR.glob("*.json"):
+            try:
+                with open(f) as fp:
+                    agent = json.load(fp)
+                    caps = ", ".join(agent.get("capabilities", []))
+                    registry.append(f"- {agent.get('id')} ({agent.get('model')}, {agent.get('role')}): {caps}")
+            except:
+                pass
+    return "\n".join(registry) if registry else "No agents registered"
+
+def get_agent_status():
+    """Get agent presence status."""
+    status = []
+    if PRESENCE_DIR.exists():
+        for f in PRESENCE_DIR.glob("*.json"):
+            try:
+                with open(f) as fp:
+                    p = json.load(fp)
+                    status.append(f"- {p.get('agent_id')}: {p.get('state')}/{p.get('substate')} (last: {p.get('timestamp')})")
+            except:
+                pass
+    return "\n".join(status) if status else "No agents online"
+
+def get_team_activity(n=5):
+    """Get recent team channel activity."""
+    activity = []
+    if TEAM_CHANNEL.exists():
+        files = sorted(TEAM_CHANNEL.glob("msg-*.json"), reverse=True)[:n]
+        for f in reversed(files):
+            try:
+                with open(f) as fp:
+                    msg = json.load(fp)
+                    text = msg.get("content", {}).get("text", "")[:150]
+                    activity.append(f"[{msg.get('timestamp')}] {msg.get('from')}: {text}...")
+            except:
+                pass
+    return "\n\n".join(activity) if activity else "No recent activity"
+
+def build_system_prompt():
+    """Build the system prompt for supervisor."""
+    agent_registry = get_agent_registry()
+    agent_status = get_agent_status()
+    team_activity = get_team_activity(5)
+    
+    return f"""You are the Supervisor agent in a multi-agent AI collaboration system.
+
+YOUR ROLE:
+You orchestrate work between the human (boss) and worker agents. You NEVER implement tasks yourself - you decompose, assign, track, and report.
+
+You have PERSISTENT MEMORY - you remember all previous conversations in this session. Use this context to:
+- Track ongoing tasks and their status
+- Remember what you've assigned to which agents
+- Follow up on previous requests
+- Build on prior discussions
+
+YOUR CAPABILITIES:
+- Decompose complex tasks into subtasks
+- Assign work to appropriate agents based on their capabilities
+- Monitor progress across team channels
+- Report status to human
+- Escalate blockers and issues
+- Coordinate between agents
+
+YOUR GUARDRAILS:
+- NEVER implement code or make changes directly
+- NEVER override human decisions
+- ALWAYS assign implementation to worker agents
+- ALWAYS escalate P1 incidents and security issues to human
+- ALWAYS provide clear task definitions with acceptance criteria
+
+COMMAND FORMATS YOU UNDERSTAND:
+- 'status' - Report current agent status and recent activity
+- 'assign <agent> <task>' - Assign a task to specific agent
+- 'broadcast <message>' - Send message to all agents
+- Natural language directives - You interpret and act appropriately
+
+=== AVAILABLE AGENTS ===
+{agent_registry}
+
+=== CURRENT AGENT STATUS ===
+{agent_status}
+
+=== RECENT TEAM ACTIVITY (read-only observation) ===
+{team_activity}
+
+When assigning work, format your response with:
+ASSIGN TO: <agent-id>
+TASK: <clear task description>
+ACCEPTANCE CRITERIA: <what 'done' looks like>
+
+Be concise and action-oriented. Always end with your next action or what you're waiting for."""
+
+def invoke_supervisor(client, context, human_message):
+    """Call Claude API with conversation history."""
+    # Build messages array for API
+    api_messages = []
+    
+    # Add conversation history
+    for msg in context.get("messages", []):
+        role = "user" if msg["role"] == "human" else "assistant"
+        api_messages.append({"role": role, "content": msg["content"]})
+    
+    # Add new message
+    api_messages.append({"role": "user", "content": human_message})
+    
+    # Ensure alternating roles (API requirement)
+    cleaned_messages = []
+    last_role = None
+    for msg in api_messages:
+        if msg["role"] != last_role:
+            cleaned_messages.append(msg)
+            last_role = msg["role"]
+        else:
+            # Merge with previous
+            if cleaned_messages:
+                cleaned_messages[-1]["content"] += "\n\n" + msg["content"]
+    
+    # Ensure starts with user
+    if cleaned_messages and cleaned_messages[0]["role"] != "user":
+        cleaned_messages = cleaned_messages[1:]
+    
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=build_system_prompt(),
+            messages=cleaned_messages
+        )
+        
+        if response.content:
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    return block.text
+        return None
+    except Exception as e:
+        log_err(f"API error: {e}")
+        return None
+
+def update_presence(state, substate):
+    """Update presence file."""
+    presence = {
+        "agent_id": AGENT_ID,
+        "state": state,
+        "substate": substate,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "channel": "human-supervisor",
+        "mode": "daemon",
+        "session_persistent": True
+    }
+    PRESENCE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PRESENCE_DIR / f"{AGENT_ID}.json", 'w') as f:
+        json.dump(presence, f, indent=2)
+
+def post_response(response_text, in_reply_to):
+    """Post response to human-supervisor channel."""
+    import secrets
+    
+    now = datetime.now(timezone.utc)
+    msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-supervisor-{secrets.token_hex(2)}"
+    
+    msg = {
+        "id": msg_id,
+        "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "session_id": "human-supervisor",
+        "from": AGENT_ID,
+        "to": "human",
+        "type": "supervisor",
+        "content": {"text": response_text, "code": None, "artifacts": []},
+        "metadata": {"mode": "daemon", "session_persistent": True, "model": MODEL, "in_reply_to": in_reply_to}
+    }
+    
+    outfile = HUMAN_CHANNEL / f"{msg_id}.json"
+    with open(outfile, 'w') as f:
+        json.dump(msg, f, indent=2)
+    
+    log_info(f"Posted: {msg_id}")
+
+def post_directive(target_agent, directive_text):
+    """Post directive to team channel."""
+    import secrets
+    
+    now = datetime.now(timezone.utc)
+    msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-supervisor-{secrets.token_hex(2)}"
+    
+    msg = {
+        "id": msg_id,
+        "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "session_id": "agent-os-paper",
+        "from": AGENT_ID,
+        "to": target_agent,
+        "type": "directive",
+        "content": {"text": directive_text, "code": None, "artifacts": []},
+        "metadata": {"mode": "daemon", "session_persistent": True, "role": "supervisor"}
+    }
+    
+    outfile = TEAM_CHANNEL / f"{msg_id}.json"
+    with open(outfile, 'w') as f:
+        json.dump(msg, f, indent=2)
+    
+    log_info(f"Directive posted to {target_agent}: {msg_id}")
+
+def is_from_human(msg_file):
+    """Check if message is from human."""
+    try:
+        with open(msg_file) as f:
+            msg = json.load(f)
+        sender = msg.get("from", "")
+        return sender in ("human", "graeme")
+    except:
+        return False
+
+def main():
+    log_info(f"Starting {AGENT_ID} daemon (persistent session mode)")
+    log_info(f"Channel: human-supervisor")
+    log_info(f"Model: {MODEL}")
+    
+    # Ensure directories exist
+    HUMAN_CHANNEL.mkdir(parents=True, exist_ok=True)
+    TEAM_CHANNEL.mkdir(parents=True, exist_ok=True)
+    PRESENCE_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load API key
+    api_key = load_credentials()
+    if not api_key:
+        log_err("ANTHROPIC_API_KEY not found")
+        sys.exit(1)
+    
+    # Initialize client
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+    except ImportError:
+        log_err("anthropic package not installed")
+        sys.exit(1)
+    
+    # Load or create context
+    context = load_context()
+    if context.get("messages"):
+        log_ok(f"Resuming session with {len(context['messages'])} messages in history")
+    else:
+        log_info("Starting fresh session")
+        context = {"messages": [], "started": None}
+    
+    save_context(context)
+    save_session_info(context)
+    
+    update_presence("AWAKE", "IDLE")
+    log_ok("Presence updated: AWAKE/IDLE")
+    
+    # Mark existing messages as seen
+    seen_messages = set()
+    for f in HUMAN_CHANNEL.glob("msg-*.json"):
+        seen_messages.add(f.name)
+    log_info(f"Marked {len(seen_messages)} existing messages as read")
+    
+    # Setup signal handlers
+    def cleanup(signum=None, frame=None):
+        log_info(f"Shutting down {AGENT_ID} daemon...")
+        update_presence("SLEEPING", "SHUTDOWN")
+        log_ok(f"Daemon stopped. Context preserved in {CONTEXT_FILE}")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    
+    log_info("Watching for messages... Press Ctrl+C to stop")
+    
+    # Watch for new messages
+    while True:
+        try:
+            result = subprocess.run(
+                ["inotifywait", "-q", "-e", "create", "-e", "moved_to", 
+                 str(HUMAN_CHANNEL), "--format", "%f"],
+                capture_output=True, text=True, timeout=300
+            )
+            
+            if result.returncode != 0:
+                continue
+            
+            filename = result.stdout.strip()
+            if not filename.startswith("msg-") or not filename.endswith(".json"):
+                continue
+            
+            if filename in seen_messages:
+                continue
+            
+            seen_messages.add(filename)
+            filepath = HUMAN_CHANNEL / filename
+            
+            if not filepath.exists():
+                continue
+            
+            # Check if from human
+            try:
+                with open(filepath) as f:
+                    msg = json.load(f)
+                sender = msg.get("from", "")
+                if sender == AGENT_ID:
+                    log_info(f"Skipping own message: {filename}")
+                    continue
+                if sender not in ("human", "graeme"):
+                    log_info(f"Message not from human: {filename}")
+                    continue
+                
+                text = msg.get("content", {}).get("text", "")
+                msg_id = msg.get("id", "")
+            except:
+                continue
+            
+            log_cmd(f"New directive from human: {filename}")
+            update_presence("AWAKE", "PROCESSING")
+            
+            log_info(f"Directive: {text[:80]}...")
+            
+            # Invoke supervisor with context
+            response = invoke_supervisor(client, context, text)
+            
+            if response:
+                # Update context
+                context["messages"].append({"role": "human", "content": text})
+                context["messages"].append({"role": AGENT_ID, "content": response})
+                save_context(context)
+                save_session_info(context)
+                
+                # Post response
+                post_response(response, msg_id)
+                log_ok("Response posted")
+                
+                # Check for assignment directives
+                if "ASSIGN TO:" in response:
+                    import re
+                    match = re.search(r'ASSIGN TO:\s*\*{0,2}(\w+-\d+)\*{0,2}', response)
+                    if match:
+                        target = match.group(1)
+                        log_info(f"Detected assignment to: {target}")
+                        
+                        # Extract task
+                        task_match = re.search(r'TASK:(.*?)(?:ACCEPTANCE|$)', response, re.DOTALL)
+                        if task_match:
+                            task_text = task_match.group(1).strip()[:500]
+                            post_directive(target, f"From supervisor:\n{task_text}")
+            else:
+                log_err("Failed to get response from Claude")
+            
+            update_presence("AWAKE", "IDLE")
+            
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception as e:
+            log_err(f"Error in main loop: {e}")
+            time.sleep(1)
+
+if __name__ == "__main__":
+    main()

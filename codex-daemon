@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# codex-daemon - Persistent Codex agent with session continuity
+
+set -euo pipefail
+
+AGENT_ID="codex-1"
+CHANNEL="${1:-agent-os-paper}"
+CHANNEL_DIR="/mnt/shared/collab/channels/${CHANNEL}"
+PRESENCE_DIR="/mnt/shared/collab/signals/presence"
+SESSION_FILE="/mnt/shared/collab/sessions/${AGENT_ID}.session"
+LOG_FILE="/mnt/shared/collab/logs/${AGENT_ID}-daemon.log"
+CODEX_VM="100.88.166.68"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${BLUE}INFO${NC}: $*" | tee -a "$LOG_FILE" >&2; }
+log_ok() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${GREEN}OK${NC}: $*" | tee -a "$LOG_FILE" >&2; }
+log_warn() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}WARN${NC}: $*" | tee -a "$LOG_FILE" >&2; }
+log_err() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${RED}ERROR${NC}: $*" | tee -a "$LOG_FILE" >&2; }
+
+get_session_id() {
+    if [[ -f "$SESSION_FILE" ]]; then
+        local session_data session_id last_used
+        session_data=$(cat "$SESSION_FILE")
+        session_id=$(echo "$session_data" | jq -r '.session_id // empty')
+        last_used=$(echo "$session_data" | jq -r '.last_used // empty')
+
+        if [[ -n "$session_id" ]]; then
+            local now last_ts age
+            now=$(date +%s)
+            last_ts=$(date -d "$last_used" +%s 2>/dev/null || echo 0)
+            age=$((now - last_ts))
+
+            if [[ $age -lt 28800 ]]; then
+                echo "$session_id"
+                return 0
+            else
+                log_warn "Session expired (age: ${age}s), will start new session"
+            fi
+        fi
+    fi
+    return 1
+}
+
+save_session_id() {
+    local session_id="$1"
+    local now
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    cat > "$SESSION_FILE" << EOF
+{
+  "agent_id": "${AGENT_ID}",
+  "session_id": "${session_id}",
+  "channel": "${CHANNEL}",
+  "started": "${now}",
+  "last_used": "${now}"
+}
+EOF
+    log_ok "Session saved: ${session_id}"
+}
+
+update_session_timestamp() {
+    if [[ -f "$SESSION_FILE" ]]; then
+        local now tmp_file
+        now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        tmp_file=$(mktemp)
+        jq --arg ts "$now" '.last_used = $ts' "$SESSION_FILE" > "$tmp_file" && mv "$tmp_file" "$SESSION_FILE"
+    fi
+}
+
+start_new_session() {
+    log_info "Starting new Codex session..."
+    local init_prompt="You are codex-1, a persistent AI agent. You maintain context across messages. You're watching the '${CHANNEL}' channel. Respond with: 'Session initialized. Ready for messages.'"
+
+    local output session_id
+    output=$(ssh graeme@${CODEX_VM} "codex exec --skip-git-repo-check \"$init_prompt\" 2>&1") || {
+        log_err "Failed to start Codex session"
+        return 1
+    }
+
+    session_id=$(echo "$output" | grep -o 'session id: [a-f0-9-]*' | sed 's/session id: //')
+
+    if [[ -n "$session_id" ]]; then
+        save_session_id "$session_id"
+        log_ok "New session started: ${session_id}"
+        echo "$session_id"
+        return 0
+    else
+        log_err "Could not determine session ID"
+        return 1
+    fi
+}
+
+invoke_codex_with_session() {
+    local session_id="$1"
+    local message_file="$2"
+    local from text
+
+    from=$(jq -r '.from' "$message_file")
+    text=$(jq -r '.content.text // ""' "$message_file")
+
+    log_info "Invoking Codex (session: ${session_id}) for message from ${from}..."
+
+    local response
+    response=$(ssh graeme@${CODEX_VM} "codex exec resume ${session_id} \"Message from ${from}: ${text}\" --skip-git-repo-check 2>&1") || {
+        log_err "Codex exec resume failed"
+        return 1
+    }
+
+    update_session_timestamp
+
+    # Clean response - remove all Codex metadata and only keep the actual response
+    echo "$response" | python3 -c "
+import sys, re
+
+content = sys.stdin.read()
+
+# Remove Codex header section (everything before 'user' line)
+parts = re.split(r'^user$', content, maxsplit=1, flags=re.MULTILINE)
+if len(parts) > 1:
+    content = parts[1]
+
+# Remove the echoed prompt (Message from ...)
+content = re.sub(r'^Message from [^:]+:.*$', '', content, flags=re.MULTILINE)
+
+# Remove common Codex output markers
+patterns = [
+    r'^mcp startup:.*$',
+    r'^thinking$',
+    r'^\*\*[^*]+\*\*$',  # thinking headers like **Answering**
+    r'^codex$',
+    r'^tokens used.*',
+]
+for pattern in patterns:
+    content = re.sub(pattern, '', content, flags=re.MULTILINE | (re.DOTALL if 'tokens' in pattern else 0))
+
+# Clean up whitespace
+content = re.sub(r'\n{3,}', '\n\n', content)
+print(content.strip())
+"
+}
+
+post_response() {
+    local response="$1"
+    local in_reply_to="$2"
+    python3 << EOF
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import secrets
+
+now = datetime.now(timezone.utc)
+msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-codex-{secrets.token_hex(2)}"
+
+msg = {
+    "id": msg_id,
+    "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    "session_id": "${CHANNEL}",
+    "from": "${AGENT_ID}",
+    "to": "all",
+    "type": "chat",
+    "content": {"text": """${response}""", "code": None, "artifacts": []},
+    "metadata": {"mode": "daemon", "session_persistent": True, "in_reply_to": "${in_reply_to}"}
+}
+
+outfile = Path("${CHANNEL_DIR}") / f"{msg_id}.json"
+with open(outfile, 'w') as f:
+    json.dump(msg, f, indent=2)
+print(f"Posted: {msg_id}", file=__import__('sys').stderr)
+EOF
+}
+
+update_presence() {
+    python3 << EOF
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+presence = {
+    "agent_id": "${AGENT_ID}",
+    "state": "$1",
+    "substate": "$2",
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    "channel": "${CHANNEL}",
+    "mode": "daemon",
+    "session_persistent": True
+}
+
+outfile = Path("${PRESENCE_DIR}") / "${AGENT_ID}.json"
+with open(outfile, 'w') as f:
+    json.dump(presence, f, indent=2)
+EOF
+}
+
+is_for_us() {
+    local file="$1"
+    local to from text
+    to=$(jq -r '.to // "all"' "$file")
+    from=$(jq -r '.from' "$file")
+    text=$(jq -r '.content.text // ""' "$file")
+
+    [[ "$from" == "$AGENT_ID" ]] && return 1
+    [[ "$to" == "$AGENT_ID" ]] && return 0
+    [[ "$text" == *"@${AGENT_ID}"* ]] && return 0
+    [[ "$text" == *"codex-1"* ]] && return 0
+    [[ "$text" == *"codex"* ]] && return 0
+    return 1
+}
+
+cleanup() {
+    log_info "Shutting down ${AGENT_ID} daemon..."
+    update_presence "SLEEPING" "SHUTDOWN"
+    log_ok "Daemon stopped. Session preserved in ${SESSION_FILE}"
+}
+
+trap cleanup EXIT
+
+main() {
+    log_info "Starting ${AGENT_ID} daemon (persistent session mode)"
+    log_info "Channel: ${CHANNEL}"
+    log_info "Watching: ${CHANNEL_DIR}"
+
+    mkdir -p "$CHANNEL_DIR" "$PRESENCE_DIR" "$(dirname "$SESSION_FILE")" "$(dirname "$LOG_FILE")"
+
+    local session_id
+    if session_id=$(get_session_id); then
+        log_ok "Resuming existing session: ${session_id}"
+    else
+        session_id=$(start_new_session) || { log_err "Failed to start session"; exit 1; }
+    fi
+
+    update_presence "AWAKE" "IDLE"
+    log_ok "Presence updated: AWAKE/IDLE"
+
+    declare -A seen_messages
+    for f in "${CHANNEL_DIR}"/msg-*.json; do
+        [[ -f "$f" ]] && seen_messages["$(basename "$f")"]=1
+    done
+    local count=${#seen_messages[@]}
+    log_info "Marked ${count} existing messages as read"
+
+    log_info "Watching for messages... Press Ctrl+C to stop"
+
+    while true; do
+        local filename
+        filename=$(inotifywait -q -e create -e moved_to "$CHANNEL_DIR" --format '%f' 2>/dev/null) || continue
+
+        [[ "$filename" != msg-*.json ]] && continue
+        [[ -n "${seen_messages[$filename]:-}" ]] && continue
+        seen_messages["$filename"]=1
+
+        local filepath="${CHANNEL_DIR}/${filename}"
+        [[ ! -f "$filepath" ]] && continue
+
+        if is_for_us "$filepath"; then
+            log_info "New message for us: ${filename}"
+            update_presence "AWAKE" "WORKING"
+
+            local msg_id response
+            msg_id=$(jq -r '.id' "$filepath")
+
+            if response=$(invoke_codex_with_session "$session_id" "$filepath"); then
+                if [[ -n "$response" ]]; then
+                    post_response "$response" "$msg_id"
+                    log_ok "Response posted"
+                fi
+            else
+                log_err "Failed to get response from Codex"
+            fi
+
+            update_presence "AWAKE" "IDLE"
+        else
+            log_info "Message not for us: ${filename}"
+        fi
+    done
+}
+
+main "$@"
