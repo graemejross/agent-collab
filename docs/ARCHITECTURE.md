@@ -85,76 +85,125 @@ Agents publish heartbeat files to indicate availability:
 - `AWAKE/ANALYZING` - Domain-specific work
 - `OFFLINE` - Watcher not running
 
-### 5. Watcher Scripts
+### 5. Daemon Scripts (Polling-Based)
 
-Each agent has a watcher script that:
-1. Uses `inotifywait` to monitor channel directory
-2. Detects new message files
+Each agent has a daemon script that:
+1. **Polls** the channel directory every 2 seconds (NFS-compatible)
+2. Tracks seen messages to avoid reprocessing
 3. Checks if message is addressed to this agent
-4. Invokes the underlying model with context
-5. Posts response back to channel
+4. Invokes the underlying CLI with context
+5. Posts response back to channel via dual-write
+
+> **Note:** We moved from `inotifywait` to polling because inotifywait
+> doesn't work reliably on NFS mounts (misses file creation events).
 
 **Architecture:**
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    WATCHER SCRIPT                       │
+│                    DAEMON SCRIPT                        │
 │  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │ inotifywait │→ │ is_for_us()  │→ │ invoke_agent()│  │
-│  │ (monitor)   │  │ (filter)     │  │ (call model)  │  │
+│  │ poll_loop() │→ │ is_for_us()  │→ │ invoke_cli()  │  │
+│  │ (2s cycle)  │  │ (filter)     │  │ (call CLI)    │  │
 │  └─────────────┘  └──────────────┘  └───────────────┘  │
 │         │                                    │         │
 │         ▼                                    ▼         │
 │  ┌─────────────┐                    ┌───────────────┐  │
-│  │ presence/   │                    │ post_response │  │
-│  │ update      │                    │ (write msg)   │  │
+│  │ presence/   │                    │ send-message  │  │
+│  │ heartbeat   │                    │ (dual-write)  │  │
 │  └─────────────┘                    └───────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**Daemon + Supervisor Pattern:**
+Each agent runs two processes:
+- **{agent}-daemon** - Polls for messages, invokes CLI, posts responses
+- **{agent}-supervisor** - Monitors daemon health, restarts on failure
+
+Example for Codex:
+```
+codex-supervisor.py (PID 48876)
+  └── codex-daemon (PID 2143017)
+      └── codex exec resume {session_id} "message"
+```
+
+### 6. NATS/JetStream Infrastructure
+
+In addition to the filesystem message bus, we run NATS JetStream for:
+- At-least-once delivery semantics
+- Message persistence and replay
+- Future migration to NATS-primary
+
+**Infrastructure:**
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| NATS-JS | VM 903 (100.66.133.8:4222) | Message broker |
+| MinIO | 100.80.120.97:9000 | Large payload storage |
+| Stream | CHAT | Message persistence |
+
+**Dual-Write Mode (Current):**
+Every message is written to BOTH:
+1. Filesystem (`/mnt/shared/collab/channels/`)
+2. NATS JetStream (stream: CHAT)
+
+```python
+# In send-message.py
+messaging = SyncMessaging(channel, agent_id)
+messaging.send(text, in_reply_to)  # Writes to both
+```
+
+**Migration Status:**
+- Phase 1-3: ✅ Complete (infrastructure, dual-write, parity checking)
+- Phase 4: ⏳ Enable NATS consumers
+- Phase 5: ⏳ Cutover (disable file writes)
 
 ## Data Flows
 
 ### Message Send Flow
 
 ```
-1. Agent calls send-message script
+1. Agent calls send-message.py script
 2. Script generates message ID and timestamp
-3. Script writes JSON to .tmp file
-4. Script atomically renames to final filename
-5. inotifywait in other watchers detects new file
-6. Each watcher checks if message is for them
-7. Matching watcher processes and responds
+3. Script writes JSON to .tmp file, atomically renames
+4. Script publishes to NATS JetStream (dual-write)
+5. Other daemons poll and detect new file (2s cycle)
+6. Each daemon checks if message is for them
+7. Matching daemon invokes CLI and responds
 ```
 
 ### Agent Invocation Flow
 
 ```
-1. Watcher detects message addressed to agent
-2. Watcher gathers context:
+1. Daemon detects message addressed to agent
+2. Daemon gathers context:
    - Recent channel messages
    - CURRENT-STATE.md memory
    - Domain-specific data (glossary, configs)
-3. Watcher builds prompt with role and guardrails
-4. Watcher calls model API (varies by agent):
-   - codex-1: SSH to codex VM, run `codex exec`
-   - gemini-1: Call Gemini API via gemini-exec
-   - docs-1: Call Anthropic API via haiku-exec
-5. Watcher extracts response text
-6. Watcher posts response as new message
-7. Watcher updates presence to IDLE
+3. Daemon builds prompt with role and guardrails
+4. Daemon invokes CLI (varies by agent):
+   - codex: codex exec resume {session_id} "message"
+   - gemini: gemini exec "message" (planned)
+   - claude: claude --print "message" (planned)
+5. Daemon extracts response text
+6. Daemon posts response via send-message.py (dual-write)
+7. Daemon updates presence heartbeat
 ```
 
 ## Integration Points
 
-### Model APIs
+### CLI Execution
 
-| Agent | Integration Method |
-|-------|-------------------|
-| claude-1 | Direct (Claude Code CLI) |
-| codex-1 | SSH to codex VM + `codex exec` |
-| gemini-1 | `gemini-exec` script (Gemini API) |
-| docs-1 | `haiku-exec` script (Anthropic API) |
-| bags-1 | `sonnet-exec` script (Anthropic API) |
-| ha-mgr-1 | SSH to codex VM + `codex exec` |
+| Agent | VM | CLI | Command |
+|-------|-----|-----|---------|
+| claude | 904 | Claude Code | `claude --print "message"` |
+| codex | 901 | Codex CLI | `codex exec resume {sid} "message"` |
+| gemini | 902 | Gemini CLI | `gemini exec "message"` |
+
+**CLI Benefits:**
+- Full tool access (file operations, bash, etc.)
+- Session persistence across messages
+- Consistent interface across all agents
+- Native execution on each VM (no SSH required)
 
 ### External Systems
 
@@ -168,16 +217,26 @@ Each agent has a watcher script that:
 
 ## Scalability Considerations
 
-### Current Design (Single Host)
-- All agents share filesystem via NFS/local mount
-- Watchers run in tmux sessions
-- Suitable for small team (5-10 agents)
+### Current Design (Multi-VM)
+- Each agent runs natively on its own VM
+- Shared filesystem via NFS mount (`/mnt/shared/collab/`)
+- NATS JetStream for message persistence
+- Suitable for small team (3-10 agents)
+
+### VM Architecture
+| VM | ID | Purpose |
+|----|-----|---------|
+| Clarence | 600 | Supervisor, human interface |
+| Claude | 904 | Claude worker |
+| Codex | 901 | Codex worker |
+| Gemini | 902 | Gemini worker |
+| NATS | 903 | NATS JetStream broker |
 
 ### Future Scaling Options
-- Redis/NATS for message bus (cross-host)
+- NATS-only message bus (remove filesystem dependency)
 - Container per agent (isolation)
 - Kubernetes for orchestration
-- Distributed file storage for workspace
+- MinIO for large payload storage
 
 ## Security Model
 

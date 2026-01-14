@@ -14,34 +14,40 @@ Single-agent AI systems face limitations:
 
 ## Solution: Multi-Agent Collaboration
 
-Multiple specialized agents collaborate through a shared message bus:
+Multiple specialized agents collaborate through a shared message bus, orchestrated by a supervisor:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         HUMAN (BOSS)                                │
-│   Observes via collab-watch │ Directs via send-message              │
+│   Interacts with Clarence │ Delegates complex tasks                 │
 └────────────────────────────┬────────────────────────────────────────┘
                              │
                              ▼
+                   ┌─────────────────────┐
+                   │   CLARENCE (600)    │
+                   │   Supervisor        │
+                   │   Claude Sonnet     │
+                   │   ORCHESTRATES ONLY │
+                   └──────────┬──────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│  CLAUDE (904) │    │  CODEX (901)  │    │  GEMINI (902) │
+│  Claude Opus  │    │  GPT-5.2      │    │  Gemini CLI   │
+│  Worker       │    │  Worker       │    │  Worker       │
+└───────────────┘    └───────────────┘    └───────────────┘
+        │                     │                     │
+        └─────────────────────┴─────────────────────┘
+                              │
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    MESSAGE BUS (/mnt/shared/collab/)                │
-│   channels/  presence/  registry/  workspace/  docs/                │
-└───────┬─────────────────┬─────────────────┬─────────────────────────┘
-        │                 │                 │
-        ▼                 ▼                 ▼
-┌───────────────┐ ┌───────────────┐ ┌───────────────┐
-│  Claude-1     │ │  Codex-1      │ │  Gemini-1     │
-│  (Opus)       │ │  (GPT-5.2)    │ │  (Flash)      │
-│  worker       │ │  worker       │ │  verifier     │
-└───────────────┘ └───────────────┘ └───────────────┘
-        │                 │                 │
-        ▼                 ▼                 ▼
-┌───────────────┐ ┌───────────────┐ ┌───────────────┐
-│  docs-1       │ │  ha-mgr-1     │ │  bags-1       │
-│  (Haiku)      │ │  (Codex)      │ │  (Sonnet)     │
-│  docs steward │ │  HA manager   │ │  bag analyst  │
-└───────────────┘ └───────────────┘ └───────────────┘
+│                    MESSAGE BUS                                       │
+│   /mnt/shared/collab/ (NFS) + NATS JetStream (dual-write)           │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Key Change:** Clarence (VM 600) is the supervisor - it orchestrates work but doesn't implement. Workers run on dedicated VMs with their respective CLIs.
 
 ## Key Principles
 
@@ -93,12 +99,16 @@ Agents are tiered by cost, routing simple tasks to cheaper models:
 | 4 | Claude Sonnet | $0.30/1K | Complex analysis |
 | 5 | Claude Opus | $1.50/1K | Architecture, coordination |
 
-## Zero-Token Monitoring
+## Low-Cost Monitoring
 
-Watcher scripts use `inotifywait` to monitor channels:
-- No API calls while idle (zero cost)
-- Instant response when mentioned
+Daemon scripts poll channels every 2 seconds:
+- No API calls while idle (near-zero cost)
+- 2-second response latency when mentioned
 - Presence tracking via heartbeat files
+- Supervisor process manages daemon lifecycle
+
+> **Note:** We moved from inotifywait to polling because inotifywait
+> doesn't work reliably on NFS mounts.
 
 ## Goals
 
@@ -117,10 +127,17 @@ Watcher scripts use `inotifywait` to monitor channels:
 ## Current Status
 
 **Phase 1 Complete**: Basic infrastructure operational
-- Message bus with channels
+- Message bus with channels (file + NATS dual-write)
 - Agent registry
-- Watcher scripts for 6 agents
-- Presence system
-- Governance documentation
+- Daemon scripts for Codex and Gemini
+- Presence system with heartbeats
+- NATS JetStream infrastructure (Issue #12)
 
-**Next**: Supervisor architecture, task lifecycle, formal workflows
+**In Progress (Issue #20)**: Supervisor MVP
+- [ ] Phase 0: Documentation alignment
+- [ ] Phase 1: Clone VM 600 → 904, rename to Clarence
+- [ ] Phase 2: Install Gemini CLI
+- [ ] Phase 3: Claude worker daemon
+- [ ] Phase 4: Supervisor daemon on Clarence
+- [ ] Phase 5: Task lifecycle
+- [ ] Phase 6: Swiss Cheese quality control

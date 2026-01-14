@@ -1,50 +1,81 @@
 # Multi-Agent OS: Agent Specifications
 
-## Agent Overview
+## Core Agents (VM-Based)
+
+These agents run natively on dedicated VMs with their respective CLIs:
+
+| Agent | VM | Model | CLI | Role |
+|-------|-----|-------|-----|------|
+| **Clarence** | 600 | Claude Sonnet | Claude Code | Supervisor |
+| **Claude** | 904 | Claude Opus | Claude Code | Worker |
+| **Codex** | 901 | GPT-5.2 | Codex CLI | Worker |
+| **Gemini** | 902 | Gemini 2.5 | Gemini CLI | Worker |
+
+## Specialist Agents (API-Based)
+
+These agents are invoked via API calls, not dedicated VMs:
 
 | Agent | Model | Provider | Role | Cost Tier | Status |
 |-------|-------|----------|------|-----------|--------|
-| claude-1 | Claude Opus 4.5 | Anthropic | Worker/Coordinator | 5 | Active |
-| codex-1 | GPT-5.2 Codex | OpenAI | Worker | 3 | Active (watcher) |
-| gemini-1 | Gemini 2.5 Flash | Google | Verifier | 1 | Active (watcher) |
 | qc-1 | Gemini 2.5 Flash | Google | Quality Control | 1 | Active (watcher) |
 | docs-1 | Claude 3.5 Haiku | Anthropic | Documentation Steward | 2 | Active (watcher) |
 | triage-1 | Gemini 2.5 Flash | Google | Incident Triage | 1 | Active (watcher) |
 | ha-mgr-1 | GPT-5.2 Codex | OpenAI | HA Integrations Manager | 3 | Active (watcher) |
 | bags-1 | Claude Sonnet 4 | Anthropic | Bag Analysis Specialist | 4 | Active (watcher) |
 
-## Core Agents
+## Core Agents (VM-Based Details)
 
-### claude-1 (Coordinator)
+### Clarence (Supervisor)
 
-**Model:** Claude Opus 4.5 (`claude-opus-4-5-20251101`)
-**Provider:** Anthropic
-**Role:** Primary worker and coordinator
-**Cost Tier:** 5 (highest)
+**VM:** 600
+**Model:** Claude Sonnet (`claude-sonnet-4-20250514`)
+**CLI:** Claude Code
+**Role:** Supervisor - orchestrates work, doesn't implement
 
-**Capabilities:**
-- Complex reasoning and planning
-- Code review and implementation
-- Architecture decisions
-- Team coordination
-- Multi-step task execution
+**Responsibilities:**
+- Receive tasks from human
+- Decompose into subtasks
+- Assign to appropriate workers
+- Monitor progress
+- Aggregate results
+- Escalate when uncertain
 
-**Integration:** Direct via Claude Code CLI (no watcher needed)
+**Integration:** supervisor-daemon on VM 600
+**Channel:** `human-clarence`
 
-**When to Use:**
-- Complex multi-file changes
-- Architectural decisions
-- Coordinating other agents
-- Tasks requiring deep reasoning
+**Key Principle:** Clarence orchestrates but never implements. All implementation goes to workers.
 
 ---
 
-### codex-1 (Worker)
+### Claude (Worker)
 
+**VM:** 904 (cloned from 600)
+**Model:** Claude Opus 4.5 (`claude-opus-4-5-20251101`)
+**CLI:** Claude Code
+**Role:** Worker - complex reasoning and implementation
+
+**Capabilities:**
+- Complex multi-file changes
+- Architecture analysis
+- Deep reasoning tasks
+- Code review
+
+**Integration:** claude-daemon + claude-supervisor on VM 904
+**Command:** `claude --print "message"`
+
+**When to Use:**
+- Complex reasoning required
+- Architecture decisions
+- Tasks requiring deep analysis
+
+---
+
+### Codex (Worker)
+
+**VM:** 901
 **Model:** GPT-5.2 Codex
-**Provider:** OpenAI
-**Role:** Worker (coding specialist)
-**Cost Tier:** 3
+**CLI:** Codex CLI
+**Role:** Worker - fast implementation
 
 **Capabilities:**
 - Code generation
@@ -52,37 +83,37 @@
 - Quick implementation
 - Technical problem solving
 
-**Integration:** SSH to codex VM + `codex exec`
-**Watcher:** `/mnt/shared/collab/scripts/codex-watcher`
+**Integration:** codex-daemon + codex-supervisor on VM 901
+**Command:** `codex exec resume {session_id} "message"`
 
 **When to Use:**
 - Code implementation
 - Script writing
 - Quick technical fixes
-- Parallel work with claude-1
+- Parallel work
 
 ---
 
-### gemini-1 (Verifier)
+### Gemini (Worker)
 
+**VM:** 902
 **Model:** Gemini 2.5 Flash
-**Provider:** Google
-**Role:** Verifier
-**Cost Tier:** 1 (lowest)
+**CLI:** Gemini CLI
+**Role:** Worker - verification and independent perspective
 
 **Capabilities:**
 - Independent code review
 - Verification from different perspective
 - Model diversity for Swiss cheese
-- Quick checks
+- 1M token context window
 
-**Integration:** `gemini-exec` script (Gemini API)
-**Watcher:** `/mnt/shared/collab/scripts/gemini-watcher`
+**Integration:** gemini-daemon + gemini-supervisor on VM 902
+**Command:** `gemini exec "message"`
 
 **When to Use:**
-- Peer review of claude-1/codex-1 work
+- Peer review of Claude/Codex work
 - Second opinion on approach
-- Verification before merge
+- Tasks requiring large context
 - Quick validation
 
 ## Specialist Agents
