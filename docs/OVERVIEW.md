@@ -34,7 +34,7 @@ Multiple specialized agents collaborate through a shared message bus, orchestrat
         │                     │                     │
         ▼                     ▼                     ▼
 ┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  CLAUDE (904) │    │  CODEX (901)  │    │  GEMINI (902) │
+│  CLAUDE (905) │    │  CODEX (901)  │    │  GEMINI (902) │
 │  Claude Opus  │    │  GPT-5.2      │    │  Gemini CLI   │
 │  Worker       │    │  Worker       │    │  Worker       │
 └───────────────┘    └───────────────┘    └───────────────┘
@@ -134,10 +134,25 @@ Daemon scripts poll channels every 2 seconds:
 - NATS JetStream infrastructure (Issue #12)
 
 **In Progress (Issue #20)**: Supervisor MVP
-- [ ] Phase 0: Documentation alignment
-- [ ] Phase 1: Clone VM 600 → 904, rename to Clarence
-- [ ] Phase 2: Install Gemini CLI
+- [x] Phase 0: Documentation alignment (commit 702b555)
+- [x] Phase 1: Clone VM 600 → 905, rename to Clarence
+- [x] Phase 2: Install Gemini CLI (v0.24.0)
 - [ ] Phase 3: Claude worker daemon
 - [ ] Phase 4: Supervisor daemon on Clarence
 - [ ] Phase 5: Task lifecycle
 - [ ] Phase 6: Swiss Cheese quality control
+
+**Infrastructure Ready:**
+| VM | Hostname | Tailscale IP | Role | Status |
+|----|----------|--------------|------|--------|
+| 600 | clarence | 100.83.146.108 | Supervisor | Ready |
+| 905 | claude | 100.80.13.26 | Worker (Opus) | Ready |
+| 901 | codex | 100.88.166.68 | Worker (GPT-5.2) | Ready |
+| 902 | gemini | 100.88.38.38 | Worker (Gemini) | Ready |
+| 903 | nats-js | 100.66.133.8 | NATS JetStream | Running |
+
+**All VMs have:**
+- Log server on port 8090 (http://{hostname}:8090)
+- Session scripts ({cli}-session)
+- GitHub CLI configured (graemejross)
+- SSH access via Tailscale

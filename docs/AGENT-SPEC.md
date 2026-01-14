@@ -4,12 +4,17 @@
 
 These agents run natively on dedicated VMs with their respective CLIs:
 
-| Agent | VM | Model | CLI | Role |
-|-------|-----|-------|-----|------|
-| **Clarence** | 600 | Claude Sonnet | Claude Code | Supervisor |
-| **Claude** | 904 | Claude Opus | Claude Code | Worker |
-| **Codex** | 901 | GPT-5.2 | Codex CLI | Worker |
-| **Gemini** | 902 | Gemini 2.5 | Gemini CLI | Worker |
+| Agent | VM | Tailscale IP | Model | CLI | Role |
+|-------|-----|--------------|-------|-----|------|
+| **Clarence** | 600 | 100.83.146.108 | Claude Sonnet | Claude Code | Supervisor |
+| **Claude** | 905 | 100.80.13.26 | Claude Opus 4.5 | Claude Code | Worker |
+| **Codex** | 901 | 100.88.166.68 | GPT-5.2 | Codex CLI | Worker |
+| **Gemini** | 902 | 100.88.38.38 | Gemini 2.5 | Gemini CLI v0.24.0 | Worker |
+
+**Infrastructure on all VMs:**
+- Log server: http://{hostname}:8090
+- Session script: `{cli}-session` (tmux + logging)
+- GitHub: `gh` CLI authenticated as graemejross
 
 ## Specialist Agents (API-Based)
 
@@ -49,7 +54,7 @@ These agents are invoked via API calls, not dedicated VMs:
 
 ### Claude (Worker)
 
-**VM:** 904 (cloned from 600)
+**VM:** 905 (cloned from 600, Tailscale: 100.80.13.26)
 **Model:** Claude Opus 4.5 (`claude-opus-4-5-20251101`)
 **CLI:** Claude Code
 **Role:** Worker - complex reasoning and implementation
@@ -60,8 +65,10 @@ These agents are invoked via API calls, not dedicated VMs:
 - Deep reasoning tasks
 - Code review
 
-**Integration:** claude-daemon + claude-supervisor on VM 904
+**Integration:** claude-daemon + claude-supervisor on VM 905
 **Command:** `claude --print "message"`
+**Session:** `ssh graeme@claude` then `~/claude-session`
+**Logs:** http://claude:8090
 
 **When to Use:**
 - Complex reasoning required
@@ -85,6 +92,8 @@ These agents are invoked via API calls, not dedicated VMs:
 
 **Integration:** codex-daemon + codex-supervisor on VM 901
 **Command:** `codex exec resume {session_id} "message"`
+**Session:** `ssh graeme@codex` then `~/codex-session`
+**Logs:** http://codex:8090
 
 **When to Use:**
 - Code implementation
@@ -108,7 +117,9 @@ These agents are invoked via API calls, not dedicated VMs:
 - 1M token context window
 
 **Integration:** gemini-daemon + gemini-supervisor on VM 902
-**Command:** `gemini exec "message"`
+**Command:** `gemini "message"` or interactive `gemini`
+**Session:** `ssh graeme@gemini` then `~/gemini-session`
+**Logs:** http://gemini:8090
 
 **When to Use:**
 - Peer review of Claude/Codex work

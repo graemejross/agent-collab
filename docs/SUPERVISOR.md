@@ -23,7 +23,7 @@ Clarence is the supervisor - an AI agent that orchestrates work across multiple 
         │                     │                     │
         ▼                     ▼                     ▼
 ┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  CLAUDE (904) │    │  CODEX (901)  │    │  GEMINI (902) │
+│  CLAUDE (905) │    │  CODEX (901)  │    │  GEMINI (902) │
 │  Claude Opus  │    │  GPT-5.2      │    │  Gemini 2.5   │
 │  Worker       │    │  Worker       │    │  Worker       │
 └───────────────┘    └───────────────┘    └───────────────┘
@@ -104,11 +104,11 @@ Each worker VM runs:
 
 ### Worker VMs
 
-| VM | ID | CLI | Tailscale |
-|----|-----|-----|-----------|
-| Claude | 904 | Claude Code | claude.ts.net |
-| Codex | 901 | Codex CLI | codex.ts.net |
-| Gemini | 902 | Gemini CLI | gemini.ts.net |
+| VM | ID | CLI | Tailscale IP |
+|----|-----|-----|--------------|
+| Claude | 905 | Claude Code (Opus) | 100.80.13.26 |
+| Codex | 901 | Codex CLI (GPT-5.2) | 100.88.166.68 |
+| Gemini | 902 | Gemini CLI (v0.24.0) | 100.88.38.38 |
 
 ### CLI Execution
 
@@ -180,9 +180,14 @@ Clarence routes tasks to minimize cost while meeting quality requirements:
 
 | Component | Status |
 |-----------|--------|
-| Clarence VM (600) | ✅ Running (was claude) |
-| Claude worker VM (904) | ❌ Clone from 600 |
+| Clarence VM (600) | ✅ Running, renamed from claude |
+| Claude worker VM (905) | ✅ Cloned from 600, configured |
+| Gemini CLI | ✅ v0.24.0 installed, authenticated |
+| Log servers | ✅ Running on all VMs (port 8090) |
+| Session scripts | ✅ gemini-session, codex-session |
+| GitHub access | ✅ gh CLI on all VMs |
 | supervisor-daemon | ❌ Create |
+| claude-daemon | ❌ Create |
 | Task lifecycle | ❌ Create |
 | human-clarence channel | ❌ Create |
 

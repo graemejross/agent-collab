@@ -195,7 +195,7 @@ messaging.send(text, in_reply_to)  # Writes to both
 
 | Agent | VM | CLI | Command |
 |-------|-----|-----|---------|
-| claude | 904 | Claude Code | `claude --print "message"` |
+| claude | 905 | Claude Code | `claude --print "message"` |
 | codex | 901 | Codex CLI | `codex exec resume {sid} "message"` |
 | gemini | 902 | Gemini CLI | `gemini exec "message"` |
 
@@ -224,13 +224,19 @@ messaging.send(text, in_reply_to)  # Writes to both
 - Suitable for small team (3-10 agents)
 
 ### VM Architecture
-| VM | ID | Purpose |
-|----|-----|---------|
-| Clarence | 600 | Supervisor, human interface |
-| Claude | 904 | Claude worker |
-| Codex | 901 | Codex worker |
-| Gemini | 902 | Gemini worker |
-| NATS | 903 | NATS JetStream broker |
+| VM | ID | Tailscale IP | Purpose |
+|----|-----|--------------|---------|
+| Clarence | 600 | 100.83.146.108 | Supervisor, human interface |
+| Claude | 905 | 100.80.13.26 | Claude worker (Opus) |
+| Codex | 901 | 100.88.166.68 | Codex worker (GPT-5.2) |
+| Gemini | 902 | 100.88.38.38 | Gemini worker (Gemini 2.5) |
+| NATS | 903 | 100.66.133.8 | NATS JetStream broker |
+
+### Infrastructure Services
+All worker VMs include:
+- **Log Server** - http://{hostname}:8090 (browse session logs)
+- **Session Script** - `{cli}-session` (tmux + logging)
+- **GitHub CLI** - `gh` authenticated as graemejross
 
 ### Future Scaling Options
 - NATS-only message bus (remove filesystem dependency)
