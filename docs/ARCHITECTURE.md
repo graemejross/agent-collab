@@ -200,8 +200,9 @@ In addition to the filesystem message bus, we run NATS JetStream for:
 | Component | Location | Purpose |
 |-----------|----------|---------|
 | NATS-JS | VM 903 (100.66.133.8:4222) | Message broker |
-| MinIO | 100.80.120.97:9000 | Large payload storage |
-| Stream | CHAT | Message persistence |
+| MinIO | 100.80.120.97:9000 | Large payload storage (>1MB) |
+| Stream | CHAT | Agent chat messages |
+| Stream | EVT | System events and notifications |
 
 **Dual-Write Mode (Current):**
 Every message is written to BOTH:
@@ -220,7 +221,7 @@ messaging.send(text, in_reply_to)  # Writes to both
 |-------|-------------|--------|-------|
 | 1 | Infrastructure | ✅ Complete | NATS VM 903, MinIO deployed |
 | 2 | Dual-Write | ✅ Active | All messages written to file + NATS |
-| 3 | Parity Validation | ⏳ In Progress | 116/116 checks passed (100% match) |
+| 3 | Parity Validation | ⏳ In Progress | 116/116 checks passed Jan 13-14 (100% match) |
 | 4 | Canary Cutover | ⏳ Pending | Enable NATS consumers for one agent |
 | 5 | Full Cutover | ⏳ Pending | All agents read from NATS |
 | 6 | Decommission | ⏳ Pending | Disable file writes |
