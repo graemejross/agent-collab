@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # codex-daemon - Persistent Codex agent with session continuity
+# Uses polling instead of inotifywait for NFS compatibility
 
 set -euo pipefail
 
@@ -9,7 +10,10 @@ CHANNEL_DIR="/mnt/shared/collab/channels/${CHANNEL}"
 PRESENCE_DIR="/mnt/shared/collab/signals/presence"
 SESSION_FILE="/mnt/shared/collab/sessions/${AGENT_ID}.session"
 LOG_FILE="/mnt/shared/collab/logs/${AGENT_ID}-daemon.log"
+HEARTBEAT_FILE="/mnt/shared/collab/logs/${AGENT_ID}-heartbeat.json"
 CODEX_VM="100.88.166.68"
+POLL_INTERVAL=2  # Seconds between polling for new messages (NFS-compatible)
+MESSAGE_COUNT=0  # Track messages processed this session
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -21,6 +25,27 @@ log_info() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${BLUE}INFO${NC}: $*" | tee
 log_ok() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${GREEN}OK${NC}: $*" | tee -a "$LOG_FILE" >&2; }
 log_warn() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}WARN${NC}: $*" | tee -a "$LOG_FILE" >&2; }
 log_err() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${RED}ERROR${NC}: $*" | tee -a "$LOG_FILE" >&2; }
+
+# Heartbeat for supervisor monitoring
+write_heartbeat() {
+    local status="${1:-idle}"
+    local last_msg_id="${2:-}"
+    python3 << EOF
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+heartbeat = {
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    "session_id": "$(cat "$SESSION_FILE" 2>/dev/null | jq -r '.session_id // "none"')",
+    "message_count": ${MESSAGE_COUNT},
+    "last_message_id": "${last_msg_id}",
+    "status": "${status}"
+}
+
+Path("${HEARTBEAT_FILE}").write_text(json.dumps(heartbeat, indent=2))
+EOF
+}
 
 get_session_id() {
     if [[ -f "$SESSION_FILE" ]]; then
@@ -73,10 +98,30 @@ update_session_timestamp() {
 
 start_new_session() {
     log_info "Starting new Codex session..."
-    local init_prompt="You are codex-1, a persistent AI agent. You maintain context across messages. You're watching the '${CHANNEL}' channel. Respond with: 'Session initialized. Ready for messages.'"
+    local init_prompt="You are codex, a persistent AI agent in a multi-agent collaboration system.
+
+## Your Runtime Environment
+You are running on VM 901 (codex) at Tailscale IP 100.88.166.68.
+Your daemon polls /mnt/shared/collab/channels/${CHANNEL}/ for messages.
+You can execute approved commands by including command blocks in your responses.
+
+## Command Execution
+Include a command block like this:
+\`\`\`command
+{\"name\": \"github-helper\", \"subcommand\": \"list-issues\", \"args\": {\"repo\": \"agent-collab\"}}
+\`\`\`
+
+Available commands:
+- github-helper: list-issues, get-issue, get-comments, comment, create-issue
+- discovery: hostname, ip, whoami, uptime, env
+
+Use discovery commands to verify your runtime environment.
+
+You're watching the '${CHANNEL}' channel. Respond with: 'Session initialized on VM 901 (codex). Ready for messages.'"
 
     local output session_id
-    output=$(ssh graeme@${CODEX_VM} "codex exec --skip-git-repo-check \"$init_prompt\" 2>&1") || {
+    # Run codex directly (daemon runs on codex VM)
+    output=$(codex exec --skip-git-repo-check "$init_prompt" 2>&1) || {
         log_err "Failed to start Codex session"
         return 1
     }
@@ -103,17 +148,42 @@ invoke_codex_with_session() {
     text=$(jq -r '.content.text // ""' "$message_file")
 
     log_info "Invoking Codex (session: ${session_id}) for message from ${from}..."
+    log_info "[DEBUG] About to declare variables..."
 
-    local response
-    response=$(ssh graeme@${CODEX_VM} "codex exec resume ${session_id} \"Message from ${from}: ${text}\" --skip-git-repo-check 2>&1") || {
-        log_err "Codex exec resume failed"
+    local response="" exit_code=0
+    # Run codex directly (daemon runs on codex VM)
+    # Disable set -e temporarily to capture exit code without crashing daemon
+    log_info "About to run: codex exec resume ${session_id} ..."
+    set +e
+    response=$(codex exec resume "${session_id}" "Message from ${from}: ${text}" --skip-git-repo-check 2>&1)
+    exit_code=$?
+    set -e
+    log_info "Codex command completed with exit code: ${exit_code}"
+    log_info "[DEBUG] Response length: ${#response}"
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_err "Codex exec resume failed (exit code: ${exit_code})"
+        log_err "Response was: ${response:0:500}"  # Log first 500 chars for debugging
         return 1
-    }
+    fi
 
-    update_session_timestamp
+    # Validate we got some response
+    if [[ -z "$response" ]]; then
+        log_err "Codex returned empty response"
+        return 1
+    fi
+
+    log_info "[DEBUG] About to update session timestamp..."
+    update_session_timestamp || log_warn "Failed to update session timestamp"
+    log_info "[DEBUG] Session timestamp updated, about to clean response..."
+    log_info "[DEBUG] Response first 100 chars: ${response:0:100}"
 
     # Clean response - remove all Codex metadata and only keep the actual response
-    echo "$response" | python3 -c "
+    # Protected with || true to prevent daemon crash on regex failures
+    local cleaned_response=""
+    log_info "[DEBUG] Starting Python cleaning..."
+    set +e
+    cleaned_response=$(echo "$response" | python3 -c "
 import sys, re
 
 content = sys.stdin.read()
@@ -140,37 +210,73 @@ for pattern in patterns:
 # Clean up whitespace
 content = re.sub(r'\n{3,}', '\n\n', content)
 print(content.strip())
-"
+" 2>/dev/null)
+    local py_exit=$?
+    set -e
+    log_info "[DEBUG] Python cleaning done, exit code: ${py_exit}, result length: ${#cleaned_response}"
+
+    # If cleaning failed, use raw response (truncated)
+    if [[ -z "$cleaned_response" ]]; then
+        log_warn "Response cleaning failed, using raw response"
+        cleaned_response="${response:0:4000}"
+    fi
+
+    log_info "[DEBUG] About to return cleaned response (${#cleaned_response} chars)"
+    echo "$cleaned_response"
 }
 
 post_response() {
     local response="$1"
     local in_reply_to="$2"
-    python3 << EOF
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-import secrets
 
-now = datetime.now(timezone.utc)
-msg_id = f"msg-{now.strftime('%Y%m%d-%H%M%S')}-codex-{secrets.token_hex(2)}"
+    # Simple file-based message posting (no Python dependencies needed)
+    # Using atomic write pattern: write to .tmp, then rename
+    local timestamp msg_id random_hex tmp_file final_file
+    timestamp=$(date -u +"%Y%m%d-%H%M%S")
+    random_hex=$(head -c 2 /dev/urandom | xxd -p)
+    msg_id="msg-${timestamp}-${AGENT_ID}-${random_hex}"
+
+    log_info "[DEBUG post_response] Creating message: ${msg_id}"
+
+    # Create JSON message using Python with stdin for safe text handling
+    local json_content
+    json_content=$(echo "$response" | python3 -c "
+import json
+import sys
+from datetime import datetime, timezone
+
+response_text = sys.stdin.read()
 
 msg = {
-    "id": msg_id,
-    "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-    "session_id": "${CHANNEL}",
-    "from": "${AGENT_ID}",
-    "to": "all",
-    "type": "chat",
-    "content": {"text": """${response}""", "code": None, "artifacts": []},
-    "metadata": {"mode": "daemon", "session_persistent": True, "in_reply_to": "${in_reply_to}"}
+    'id': '${msg_id}',
+    'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+    'session_id': '${CHANNEL}',
+    'from': '${AGENT_ID}',
+    'to': 'all',
+    'type': 'chat',
+    'content': {
+        'text': response_text,
+        'code': None,
+        'artifacts': []
+    },
+    'metadata': {
+        'mode': 'daemon',
+        'session_persistent': True,
+        'in_reply_to': '${in_reply_to}'
+    }
 }
+print(json.dumps(msg, indent=2))
+")
 
-outfile = Path("${CHANNEL_DIR}") / f"{msg_id}.json"
-with open(outfile, 'w') as f:
-    json.dump(msg, f, indent=2)
-print(f"Posted: {msg_id}", file=__import__('sys').stderr)
-EOF
+    # Atomic write: tmp file, then rename
+    tmp_file="${CHANNEL_DIR}/.tmp-${msg_id}.json"
+    final_file="${CHANNEL_DIR}/${msg_id}.json"
+
+    echo "$json_content" > "$tmp_file"
+    mv "$tmp_file" "$final_file"
+
+    log_info "[DEBUG post_response] Message posted: ${final_file}"
+    return 0
 }
 
 update_presence() {
@@ -235,6 +341,10 @@ main() {
     update_presence "AWAKE" "IDLE"
     log_ok "Presence updated: AWAKE/IDLE"
 
+    # Initial heartbeat for supervisor
+    write_heartbeat "idle"
+    log_ok "Heartbeat initialized"
+
     declare -A seen_messages
     for f in "${CHANNEL_DIR}"/msg-*.json; do
         [[ -f "$f" ]] && seen_messages["$(basename "$f")"]=1
@@ -242,39 +352,73 @@ main() {
     local count=${#seen_messages[@]}
     log_info "Marked ${count} existing messages as read"
 
-    log_info "Watching for messages... Press Ctrl+C to stop"
+    log_info "Polling for messages every ${POLL_INTERVAL}s... Press Ctrl+C to stop"
 
+    local idle_heartbeat_counter=0
+    # Poll for new messages (NFS-compatible, unlike inotifywait)
     while true; do
-        local filename
-        filename=$(inotifywait -q -e create -e moved_to "$CHANNEL_DIR" --format '%f' 2>/dev/null) || continue
+        # Update heartbeat every 5 poll cycles (10s) while idle
+        ((idle_heartbeat_counter++)) || true
+        if [[ $idle_heartbeat_counter -ge 5 ]]; then
+            write_heartbeat "idle"
+            idle_heartbeat_counter=0
+        fi
+        # Get list of message files and check for new ones
+        for filepath in "${CHANNEL_DIR}"/msg-*.json; do
+            [[ ! -f "$filepath" ]] && continue
 
-        [[ "$filename" != msg-*.json ]] && continue
-        [[ -n "${seen_messages[$filename]:-}" ]] && continue
-        seen_messages["$filename"]=1
+            local filename
+            filename=$(basename "$filepath")
 
-        local filepath="${CHANNEL_DIR}/${filename}"
-        [[ ! -f "$filepath" ]] && continue
+            # Skip already seen messages
+            [[ -n "${seen_messages[$filename]:-}" ]] && continue
+            seen_messages["$filename"]=1
 
-        if is_for_us "$filepath"; then
-            log_info "New message for us: ${filename}"
-            update_presence "AWAKE" "WORKING"
+            if is_for_us "$filepath"; then
+                log_info "New message for us: ${filename}"
+                update_presence "AWAKE" "WORKING"
+                write_heartbeat "processing" "$filename"
 
-            local msg_id response
-            msg_id=$(jq -r '.id' "$filepath")
+                local msg_id response
+                msg_id=$(jq -r '.id' "$filepath")
+                log_info "[DEBUG main] About to invoke_codex_with_session..."
 
-            if response=$(invoke_codex_with_session "$session_id" "$filepath"); then
-                if [[ -n "$response" ]]; then
+                set +e
+                response=$(invoke_codex_with_session "$session_id" "$filepath")
+                local invoke_exit=$?
+                set -e
+                log_info "[DEBUG main] invoke returned exit: ${invoke_exit}, response: '${response:0:50}'"
+
+                if [[ $invoke_exit -eq 0 ]] && [[ -n "$response" ]]; then
+                    log_info "[DEBUG main] About to post_response..."
                     post_response "$response" "$msg_id"
                     log_ok "Response posted"
-                fi
-            else
-                log_err "Failed to get response from Codex"
-            fi
 
-            update_presence "AWAKE" "IDLE"
-        else
-            log_info "Message not for us: ${filename}"
-        fi
+                    # Check for command blocks and execute them
+                    local cmd_result
+                    if cmd_result=$(echo "$response" | /mnt/shared/collab/scripts/execute-command-block.py "$AGENT_ID" 2>/dev/null); then
+                        if [[ -n "$cmd_result" ]]; then
+                            log_info "Command block executed, posting result"
+                            post_response "$cmd_result" "$msg_id"
+                            log_ok "Command result posted"
+                        fi
+                    fi
+                    # Increment message count after successful processing
+                    log_info "[DEBUG main] Incrementing message count..."
+                    ((MESSAGE_COUNT++)) || true
+                else
+                    log_err "Failed to get response from Codex (exit: ${invoke_exit})"
+                fi
+
+                update_presence "AWAKE" "IDLE"
+                write_heartbeat "idle" "$msg_id"
+            else
+                log_info "Message not for us: ${filename}"
+            fi
+        done
+
+        # Sleep before next poll
+        sleep "$POLL_INTERVAL"
     done
 }
 
