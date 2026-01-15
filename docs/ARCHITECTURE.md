@@ -13,21 +13,43 @@ The shared filesystem serves as the communication backbone:
 │   │   ├── msg-20260111-163315-claude-1-4c78.json
 │   │   └── msg-20260111-163321-codex-9099.json
 │   └── {channel-name}/ # Other channels
-├── presence/           # Agent heartbeats
-│   ├── claude-1.json
-│   ├── codex-1.json
-│   └── gemini-1.json
+├── signals/
+│   └── presence/       # Agent heartbeats
+│       ├── claude.json
+│       ├── codex.json
+│       ├── gemini.json
+│       └── supervisor.json
 ├── registry/           # Agent definitions
 │   └── agents/
-│       ├── claude-1.json
-│       ├── codex-1.json
-│       └── ha-mgr-1.json
+│       ├── claude.json
+│       ├── codex.json
+│       ├── gemini.json
+│       ├── supervisor.json
+│       └── {specialist}-{n}.json
 ├── docs/               # System documentation
 ├── workspace/          # Shared artifacts
 └── logs/               # Watcher logs
 ```
 
-### 2. Channels
+### 2. Agent ID Naming Convention
+
+**Standard agent IDs:**
+
+| Type | Pattern | Examples |
+|------|---------|----------|
+| Core Workers | `{model}` | `claude`, `codex`, `gemini` |
+| Supervisor | `supervisor` | `supervisor` |
+| Specialists | `{role}-{n}` | `qc-1`, `docs-1`, `bags-1` |
+
+**Rules:**
+- Use lowercase, no spaces
+- Workers use simple model names (no version numbers)
+- Specialists use role prefix with instance number
+- IDs must match across: registry, presence, daemon scripts, message `from` field
+
+**Deprecated:** `code-1`, `code-2`, `claude-1`, `codex-1` (legacy, archived)
+
+### 3. Channels
 
 Channels are directories containing chronologically-ordered message files.
 
@@ -43,7 +65,47 @@ Channels are directories containing chronologically-ordered message files.
 msg-{YYYYMMDD}-{HHMMSS}-{agent}-{random4hex}.json
 ```
 
-### 3. Agent Registry
+### 4. Atomic Message Write Pattern
+
+**CRITICAL:** All message writes MUST use the atomic temp-file-then-rename pattern to prevent race conditions and partial reads.
+
+```python
+# CORRECT: Atomic write pattern
+import secrets
+from pathlib import Path
+
+def write_message(channel_dir: Path, message: dict) -> Path:
+    msg_id = f"msg-{timestamp}-{agent}-{secrets.token_hex(2)}"
+
+    # Step 1: Write to temporary file
+    tmp_file = channel_dir / f".tmp-{msg_id}.json"
+    with open(tmp_file, 'w') as f:
+        json.dump(message, f, indent=2)
+
+    # Step 2: Atomic rename (POSIX guarantees atomicity)
+    final_file = channel_dir / f"{msg_id}.json"
+    tmp_file.rename(final_file)
+
+    return final_file
+```
+
+**Why this matters:**
+- `rename()` is atomic on POSIX filesystems (including NFS)
+- Readers never see partial/corrupt JSON
+- Prevents race conditions when multiple agents write simultaneously
+- Avoids the need for file locking
+
+**Anti-patterns to AVOID:**
+```python
+# WRONG: Direct write (readers may see partial content)
+with open(channel_dir / f"{msg_id}.json", 'w') as f:
+    json.dump(message, f)
+
+# WRONG: Copy instead of rename (not atomic)
+shutil.copy(tmp_file, final_file)
+```
+
+### 5. Agent Registry
 
 Each agent has a registration file defining capabilities and constraints:
 
@@ -64,13 +126,13 @@ Each agent has a registration file defining capabilities and constraints:
 }
 ```
 
-### 4. Presence System
+### 6. Presence System
 
 Agents publish heartbeat files to indicate availability:
 
 ```json
 {
-  "agent_id": "codex-1",
+  "agent_id": "codex",
   "timestamp": "2026-01-11T16:30:00.000Z",
   "state": "AWAKE",
   "substate": "IDLE",
@@ -85,7 +147,7 @@ Agents publish heartbeat files to indicate availability:
 - `AWAKE/ANALYZING` - Domain-specific work
 - `OFFLINE` - Watcher not running
 
-### 5. Daemon Scripts (Polling-Based)
+### 7. Daemon Scripts (Polling-Based)
 
 Each agent has a daemon script that:
 1. **Polls** the channel directory every 2 seconds (NFS-compatible)
@@ -126,7 +188,7 @@ codex-supervisor.py (PID 48876)
       └── codex exec resume {session_id} "message"
 ```
 
-### 6. NATS/JetStream Infrastructure
+### 8. NATS/JetStream Infrastructure
 
 In addition to the filesystem message bus, we run NATS JetStream for:
 - At-least-once delivery semantics

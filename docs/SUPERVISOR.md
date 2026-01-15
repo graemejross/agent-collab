@@ -75,6 +75,66 @@ Escalate when:
 - Workers disagree
 - Confidence is low
 
+## Escalation Paths
+
+When Clarence encounters issues it cannot resolve autonomously, it follows defined escalation paths.
+
+### Escalation Triggers
+
+| Trigger | Condition | Action |
+|---------|-----------|--------|
+| **Ambiguous Task** | Cannot parse requirements | Ask human for clarification |
+| **Worker Timeout** | No response in 5 minutes | Retry once, then escalate |
+| **Worker Disagreement** | Two workers give conflicting results | Escalate with both perspectives |
+| **High Risk** | Task involves production, security, or money | Require human approval before execution |
+| **Low Confidence** | Supervisor uncertain about approach | Present options to human |
+| **Repeated Failure** | Same task fails 3+ times | Stop and escalate |
+
+### Escalation Levels
+
+```
+Level 0: Autonomous
+  └── Supervisor handles without human involvement
+      Examples: Routine task assignment, status updates
+
+Level 1: Inform
+  └── Supervisor proceeds but notifies human
+      Examples: Retry after timeout, switching to fallback worker
+
+Level 2: Approve
+  └── Supervisor proposes action, waits for human approval
+      Examples: Production changes, new dependencies, security decisions
+
+Level 3: Handoff
+  └── Supervisor cannot proceed, hands task to human
+      Examples: Fundamental ambiguity, repeated failures, policy questions
+```
+
+### Escalation Protocol
+
+1. **Document the situation** - What happened, what was tried, what failed
+2. **Present options** - If possible, offer 2-3 approaches with trade-offs
+3. **Recommend one** - State which option supervisor would choose and why
+4. **Wait for response** - Do not proceed until human responds
+5. **Implement decision** - Execute human's choice, log the decision
+
+### Timeout Handling
+
+| Component | Timeout | Action on Timeout |
+|-----------|---------|-------------------|
+| Worker response | 5 min | Retry once, then escalate |
+| Human response | None | Wait indefinitely (supervisor never times out on human) |
+| CLI invocation | 5 min | Kill process, mark task failed |
+| NATS publish | 30 sec | Fall back to filesystem only |
+
+### Circuit Breaker
+
+If a worker fails 3 times in 15 minutes:
+1. Stop routing tasks to that worker
+2. Alert human: "Worker {name} circuit breaker OPEN"
+3. Continue with remaining workers
+4. Reset circuit breaker after 10 minutes of no failures
+
 ## Supervisor Daemon
 
 **Location:** `/mnt/shared/collab/scripts/supervisor-daemon.py`
@@ -186,10 +246,15 @@ Clarence routes tasks to minimize cost while meeting quality requirements:
 | Log servers | ✅ Running on all VMs (port 8090) |
 | Session scripts | ✅ gemini-session, codex-session |
 | GitHub access | ✅ gh CLI on all VMs |
-| supervisor-daemon | ❌ Create |
-| claude-daemon | ❌ Create |
-| Task lifecycle | ❌ Create |
-| human-clarence channel | ❌ Create |
+| supervisor-daemon | ✅ Created, polling-based |
+| claude-daemon | ✅ Created |
+| claude-supervisor | ✅ Created |
+| codex-daemon | ✅ Running |
+| codex-supervisor | ✅ Running |
+| gemini-daemon | ✅ Created |
+| gemini-supervisor | ✅ Created |
+| Task lifecycle | ❌ Phase 5 |
+| human-supervisor channel | ✅ Exists |
 
 ## Related Issues
 
