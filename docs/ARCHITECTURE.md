@@ -214,10 +214,21 @@ messaging = SyncMessaging(channel, agent_id)
 messaging.send(text, in_reply_to)  # Writes to both
 ```
 
-**Migration Status:**
-- Phase 1-3: ✅ Complete (infrastructure, dual-write, parity checking)
-- Phase 4: ⏳ Enable NATS consumers
-- Phase 5: ⏳ Cutover (disable file writes)
+**Migration Status (Updated 2026-01-15):**
+
+| Phase | Description | Status | Notes |
+|-------|-------------|--------|-------|
+| 1 | Infrastructure | ✅ Complete | NATS VM 903, MinIO deployed |
+| 2 | Dual-Write | ✅ Active | All messages written to file + NATS |
+| 3 | Parity Validation | ⏳ In Progress | 116/116 checks passed (100% match) |
+| 4 | Canary Cutover | ⏳ Pending | Enable NATS consumers for one agent |
+| 5 | Full Cutover | ⏳ Pending | All agents read from NATS |
+| 6 | Decommission | ⏳ Pending | Disable file writes |
+
+**Validation Results (as of 2026-01-15):**
+- Parity observer ran Jan 13-14: 116 messages checked, 0 mismatches
+- Dual-write test verified: both `file_path` and `nats_ack` returned
+- Streams active: CHAT, EVT receiving messages
 
 ## Data Flows
 
