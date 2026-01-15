@@ -229,53 +229,42 @@ post_response() {
     local response="$1"
     local in_reply_to="$2"
 
-    # Simple file-based message posting (no Python dependencies needed)
-    # Using atomic write pattern: write to .tmp, then rename
-    local timestamp msg_id random_hex tmp_file final_file
-    timestamp=$(date -u +"%Y%m%d-%H%M%S")
-    random_hex=$(head -c 2 /dev/urandom | xxd -p)
-    msg_id="msg-${timestamp}-${AGENT_ID}-${random_hex}"
+    log_info "[DEBUG post_response] Posting response via send-message.py (dual-write)"
 
-    log_info "[DEBUG post_response] Creating message: ${msg_id}"
+    # Use send-message.py for dual-write (file + NATS)
+    # Write response to temp file to handle multiline/special chars safely
+    local tmp_file="/tmp/codex-response-$$.txt"
+    echo "$response" > "$tmp_file"
 
-    # Create JSON message using Python with stdin for safe text handling
-    local json_content
-    json_content=$(echo "$response" | python3 -c "
-import json
-import sys
-from datetime import datetime, timezone
+    local result exit_code
+    set +e
+    result=$(cd /mnt/shared/collab/scripts && python3 send-message.py \
+        --agent "${AGENT_ID}" \
+        --channel "${CHANNEL}" \
+        --to all \
+        --in-reply-to "${in_reply_to}" \
+        --text "$(cat "$tmp_file")" 2>&1)
+    exit_code=$?
+    set -e
 
-response_text = sys.stdin.read()
+    rm -f "$tmp_file"
 
-msg = {
-    'id': '${msg_id}',
-    'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-    'session_id': '${CHANNEL}',
-    'from': '${AGENT_ID}',
-    'to': 'all',
-    'type': 'chat',
-    'content': {
-        'text': response_text,
-        'code': None,
-        'artifacts': []
-    },
-    'metadata': {
-        'mode': 'daemon',
-        'session_persistent': True,
-        'in_reply_to': '${in_reply_to}'
-    }
-}
-print(json.dumps(msg, indent=2))
-")
+    if [[ $exit_code -ne 0 ]]; then
+        log_err "[DEBUG post_response] send-message.py failed (exit $exit_code): ${result:0:500}"
+        return 1
+    fi
 
-    # Atomic write: tmp file, then rename
-    tmp_file="${CHANNEL_DIR}/.tmp-${msg_id}.json"
-    final_file="${CHANNEL_DIR}/${msg_id}.json"
+    # Extract message ID from result
+    local msg_id=$(echo "$result" | grep -o 'msg-[0-9]*-[0-9]*-[a-z]*-[a-f0-9]*' | head -1)
+    log_info "[DEBUG post_response] Message posted: ${msg_id}"
 
-    echo "$json_content" > "$tmp_file"
-    mv "$tmp_file" "$final_file"
+    # Check for NATS ack in result
+    if echo "$result" | grep -q "nats_ack"; then
+        log_info "[DEBUG post_response] NATS dual-write confirmed"
+    else
+        log_warn "[DEBUG post_response] File-only write (no NATS ack)"
+    fi
 
-    log_info "[DEBUG post_response] Message posted: ${final_file}"
     return 0
 }
 
