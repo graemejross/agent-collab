@@ -3,14 +3,14 @@
 ## Monitoring Agent Health
 
 ### Presence Files
-Check `/mnt/shared/collab/presence/*.json` for agent status:
+Check `/mnt/shared/collab/signals/presence/*.json` for agent status:
 
 ```bash
 # Quick status of all agents
 /mnt/shared/collab/scripts/who
 
 # Detailed status of specific agent
-cat /mnt/shared/collab/presence/codex-1.json
+cat /mnt/shared/collab/signals/presence/codex.json
 ```
 
 **Presence Fields:**
@@ -60,10 +60,10 @@ Expected output:
 ```
 AGENT        STATE         CHANNEL           LAST SEEN
 ─────────────────────────────────────────────────────────
-codex-1      AWAKE/IDLE    agent-os-paper    5 seconds ago
-gemini-1     AWAKE/IDLE    agent-os-paper    3 seconds ago
-docs-1       AWAKE/IDLE    agent-os-paper    8 seconds ago
-ha-mgr-1     AWAKE/IDLE    agent-os-paper    2 seconds ago
+claude       AWAKE/IDLE    agent-os-paper    5 seconds ago
+codex        AWAKE/IDLE    agent-os-paper    3 seconds ago
+gemini       AWAKE/IDLE    agent-os-paper    8 seconds ago
+supervisor   AWAKE/IDLE    agent-os-paper    2 seconds ago
 ```
 
 ### Start a Watcher
@@ -96,8 +96,8 @@ tmux attach -t codex-watcher
 
 ### Send Test Message
 ```bash
-COLLAB_SESSION=agent-os-paper COLLAB_AGENT=human \
-  /mnt/shared/collab/scripts/send-message codex-1 "Health check - please respond"
+cd /mnt/shared/collab/scripts
+./send-message.py --agent supervisor --channel agent-os-paper --to codex --text "Health check - please respond"
 ```
 
 ## Incident Response
@@ -108,7 +108,7 @@ COLLAB_SESSION=agent-os-paper COLLAB_AGENT=human \
 - Check presence files for last known state
 - Use triage-1 for severity classification:
   ```bash
-  send-message triage-1 "Incident: codex-1 not responding to messages since 14:00"
+  ./send-message.py --agent supervisor --channel agent-os-paper --to triage-1 --text "Incident: codex not responding to messages since 14:00"
   ```
 
 ### 2. Containment
@@ -128,8 +128,8 @@ Check in order:
 
 ```bash
 # Quick diagnostic
-cat /mnt/shared/collab/presence/codex-1.json
-tail -30 /mnt/shared/collab/logs/codex-watcher.log
+cat /mnt/shared/collab/signals/presence/codex.json
+tail -30 /mnt/shared/collab/logs/codex-daemon.log
 ls -lt /mnt/shared/collab/channels/agent-os-paper/ | head -5
 df -h /mnt/shared/collab
 ```
@@ -145,7 +145,7 @@ sleep 3
 /mnt/shared/collab/scripts/who | grep codex
 
 # Re-send last message if needed
-send-message codex-1 "Retry: <original request>"
+./send-message.py --agent supervisor --channel agent-os-paper --to codex --text "Retry: <original request>"
 ```
 
 ### 5. Post-Incident
@@ -165,8 +165,8 @@ Quick script to check all agents:
 echo "=== Agent Health Check ==="
 echo ""
 
-for agent in codex-1 gemini-1 docs-1 qc-1 triage-1 ha-mgr-1 bags-1; do
-    presence="/mnt/shared/collab/presence/${agent}.json"
+for agent in claude codex gemini supervisor qc-1 docs-1 triage-1; do
+    presence="/mnt/shared/collab/signals/presence/${agent}.json"
     if [[ -f "$presence" ]]; then
         state=$(jq -r '.state + "/" + .substate' "$presence")
         ts=$(jq -r '.timestamp' "$presence")

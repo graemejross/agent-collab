@@ -221,15 +221,17 @@ messaging.send(text, in_reply_to)  # Writes to both
 |-------|-------------|--------|-------|
 | 1 | Infrastructure | ✅ Complete | NATS VM 903, MinIO deployed |
 | 2 | Dual-Write | ✅ Active | All messages written to file + NATS |
-| 3 | Parity Validation | ⏳ In Progress | 116/116 checks passed Jan 13-14 (100% match) |
+| 3 | Parity Validation | ⏳ In Progress | 116/116 checks passed Jan 13-14; observer restarted Jan 15 |
 | 4 | Canary Cutover | ⏳ Pending | Enable NATS consumers for one agent |
 | 5 | Full Cutover | ⏳ Pending | All agents read from NATS |
 | 6 | Decommission | ⏳ Pending | Disable file writes |
 
 **Validation Results (as of 2026-01-15):**
-- Parity observer ran Jan 13-14: 116 messages checked, 0 mismatches
+- Parity observer ran Jan 13-14: 116 messages checked, 0 mismatches (100% match)
+- Parity observer restarted Jan 15 after transient timeout crash
 - Dual-write test verified: both `file_path` and `nats_ack` returned
 - Streams active: CHAT, EVT receiving messages
+- Next milestone: 48+ hours of continuous parity validation for Phase 4
 
 ## Data Flows
 

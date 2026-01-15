@@ -6,11 +6,11 @@ All messages are JSON files with this schema:
 
 ```json
 {
-  "id": "msg-20260111-163315-claude-1-4c78",
+  "id": "msg-20260111-163315-claude-4c78",
   "timestamp": "2026-01-11T16:33:15.123Z",
   "session_id": "agent-os-paper",
-  "from": "claude-1",
-  "to": "codex-1",
+  "from": "claude",
+  "to": "codex",
   "type": "chat",
   "content": {
     "text": "Your message text here",
@@ -19,8 +19,8 @@ All messages are JSON files with this schema:
   },
   "metadata": {
     "mode": "chat",
-    "turn": "claude-1",
-    "in_reply_to": "msg-20260111-163300-codex-1-a1b2"
+    "turn": "claude",
+    "in_reply_to": "msg-20260111-163300-codex-a1b2"
   }
 }
 ```
@@ -65,15 +65,15 @@ msg-{YYYYMMDD}-{HHMMSS}-{agent}-{hex4}.json
 - `msg-` - Fixed prefix
 - `YYYYMMDD` - Date in UTC
 - `HHMMSS` - Time in UTC
-- `agent` - Sender ID (e.g., claude-1, codex, hamgr)
+- `agent` - Sender ID (e.g., claude, codex, supervisor, qc-1)
 - `hex4` - 4-character random hex for uniqueness
 
 **Examples:**
 ```
-msg-20260111-163315-claude-1-4c78.json
+msg-20260111-163315-claude-4c78.json
 msg-20260111-163321-codex-9099.json
-msg-20260111-163326-docs-4e99.json
-msg-20260111-155709-hamgr-b4f6.json
+msg-20260111-163326-supervisor-4e99.json
+msg-20260111-155709-qc-1-b4f6.json
 ```
 
 ## Channel Semantics
@@ -81,7 +81,7 @@ msg-20260111-155709-hamgr-b4f6.json
 ### Directory Structure
 ```
 /mnt/shared/collab/channels/{channel-name}/
-├── msg-20260111-100000-claude-1-0001.json
+├── msg-20260111-100000-claude-0001.json
 ├── msg-20260111-100030-codex-0002.json
 └── msg-20260111-100045-gemini-0003.json
 ```
@@ -104,7 +104,7 @@ msg-20260111-155709-hamgr-b4f6.json
 ### Direct Address
 Set `"to": "agent-id"` to address a specific agent:
 ```json
-{"to": "codex-1", "text": "codex-1 Please review this code"}
+{"to": "codex", "text": "@codex Please review this code"}
 ```
 
 ### Broadcast
@@ -116,7 +116,7 @@ Set `"to": "all"` for messages to everyone:
 ### Mentions
 Include `@agent-id` in text to get agent's attention:
 ```json
-{"to": "all", "text": "@codex-1 @gemini-1 Please review"}
+{"to": "all", "text": "@codex @gemini Please review"}
 ```
 
 ## Watcher Pattern
@@ -143,17 +143,20 @@ is_for_us() {
 ### Response Flow
 
 ```
-1. inotifywait detects new .json file
-2. Watcher reads file, checks is_for_us()
+1. Daemon polls channel directory (2s cycle, NFS-compatible)
+2. Daemon reads new file, checks is_for_us()
 3. If not for us: log and skip
 4. If from us: skip (prevent loops)
 5. Gather context (recent messages, memory)
 6. Build prompt with role and guardrails
-7. Call model API
+7. Call CLI (codex exec, claude --print, etc.)
 8. Extract response text
-9. Post response as new message
+9. Post response as new message (atomic write + NATS dual-write)
 10. Update presence to IDLE
 ```
+
+> **Note:** We use polling instead of `inotifywait` because inotifywait doesn't
+> work reliably on NFS mounts (misses file creation events).
 
 ### Avoiding Loops
 
@@ -170,31 +173,28 @@ is_from_us() {
 ### Usage
 ```bash
 # Direct to agent
-send-message codex-1 "Please review this"
+./send-message.py --agent supervisor --channel agent-os-paper --to codex --text "Please review this"
 
 # Broadcast
-send-message all "Team announcement"
-
-# With options
-send-message --to codex-1 --code "print('hi')" "Here's code"
+./send-message.py --agent supervisor --channel agent-os-paper --to all --text "Team announcement"
 ```
 
-### Auto-Detection
+### Agent ID Patterns
 
-The script auto-detects recipient patterns:
-- `claude-[0-9]+`, `codex-[0-9]+`, `gemini-[0-9]+`
-- `ha-mgr-[0-9]+`, `bags-[0-9]+`, `qc-[0-9]+`
-- `docs-[0-9]+`, `triage-[0-9]+`
-- `supervisor`, `human`, `all`
+| Type | Pattern | Examples |
+|------|---------|----------|
+| Core Workers | `{model}` | `claude`, `codex`, `gemini` |
+| Supervisor | `supervisor` | `supervisor` |
+| Specialists | `{role}-{n}` | `qc-1`, `docs-1`, `bags-1` |
 
-When first argument matches, sets `"to"` field appropriately.
+**Deprecated:** `claude-1`, `codex-1`, `gemini-1` (legacy, no longer used)
 
 ## Presence Protocol
 
 ### Heartbeat File
 ```json
 {
-  "agent_id": "codex-1",
+  "agent_id": "codex",
   "timestamp": "2026-01-11T16:30:00.000Z",
   "state": "AWAKE",
   "substate": "IDLE",
@@ -217,7 +217,7 @@ AWAKE/* → OFFLINE (watcher shutdown)
 /mnt/shared/collab/scripts/who
 
 # Check specific agent
-cat /mnt/shared/collab/presence/codex-1.json
+cat /mnt/shared/collab/signals/presence/codex.json
 ```
 
 ## Error Handling

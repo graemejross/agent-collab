@@ -117,7 +117,7 @@ These agents are invoked via API calls, not dedicated VMs:
 - 1M token context window
 
 **Integration:** gemini-daemon + gemini-supervisor on VM 902
-**Command:** `gemini "message"` or interactive `gemini`
+**Command:** `gemini exec "message"` or interactive `gemini`
 **Session:** `ssh graeme@gemini` then `~/gemini-session`
 **Logs:** http://gemini:8090
 
